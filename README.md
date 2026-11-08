@@ -1,10 +1,13 @@
 # s3fs
 
-s3fs allows Linux, macOS, and FreeBSD to mount an S3 bucket via FUSE.
-s3fs preserves the native object format for files, allowing use of other
-tools like [AWS CLI](https://github.com/aws/aws-cli).  
-[![s3fs-fuse CI](https://github.com/s3fs-fuse/s3fs-fuse/workflows/s3fs-fuse%20CI/badge.svg)](https://github.com/s3fs-fuse/s3fs-fuse/actions)
+s3fs allows Linux, macOS, FreeBSD, and AIX to mount an S3 bucket via [FUSE(Filesystem in Userspace)](https://github.com/libfuse/libfuse).
+s3fs makes you operate files and directories in S3 bucket like a local file system.
+s3fs preserves the native object format for files, allowing use of other tools like [AWS CLI](https://github.com/aws/aws-cli).  
+
+[![s3fs-fuse CI](https://github.com/s3fs-fuse/s3fs-fuse/actions/workflows/ci.yml/badge.svg)](https://github.com/s3fs-fuse/s3fs-fuse/actions/workflows/ci.yml)
 [![Twitter Follow](https://img.shields.io/twitter/follow/s3fsfuse.svg?style=social&label=Follow)](https://twitter.com/s3fsfuse)
+
+![s3fs-fuse](https://github.com/ggtakec/s3fs-fuse-images/blob/master/images/s3fslogo.png)
 
 ## Features
 
@@ -23,6 +26,11 @@ tools like [AWS CLI](https://github.com/aws/aws-cli).
 ## Installation
 
 Many systems provide pre-built packages:
+
+* AIX:
+
+  See the [s3fs for AIX](https://github.com/hettica/aix-s3fs-fuse) project for RPM build instructions and its [releases page](https://github.com/hettica/aix-s3fs-fuse/releases) for published packages.
+
 
 * Amazon Linux via EPEL:
 
@@ -68,11 +76,11 @@ Many systems provide pre-built packages:
   sudo zypper install s3fs
   ```
 
-* macOS via [Homebrew](https://brew.sh/):
+* macOS 10.12 and newer via [Homebrew](https://brew.sh/):
 
   ```
-  brew install --cask osxfuse
-  brew install s3fs
+  brew install --cask macfuse
+  brew install gromgit/fuse/s3fs-mac
   ```
 
 * FreeBSD:
@@ -81,8 +89,9 @@ Many systems provide pre-built packages:
   pkg install fusefs-s3fs
   ```
 
-Note: Homebrew has deprecated osxfuse and s3fs may not install any more, see
-[#1618](https://github.com/s3fs-fuse/s3fs-fuse/issues/1618).
+* Windows:
+
+  Windows has its own install, seening in [this link](COMPILATION.md)
 
 Otherwise consult the [compilation instructions](COMPILATION.md).
 
@@ -91,6 +100,8 @@ Otherwise consult the [compilation instructions](COMPILATION.md).
 s3fs supports the standard
 [AWS credentials file](https://docs.aws.amazon.com/cli/latest/userguide/cli-config-files.html)
 stored in `${HOME}/.aws/credentials`.  Alternatively, s3fs supports a custom passwd file.
+Finally s3fs recognizes the `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`
+environment variables.
 
 The default location for the s3fs password file can be created:
 
@@ -158,6 +169,8 @@ Generally S3 cannot offer the same performance or semantics as a local file syst
 
 ## References
 
+* [CSI for S3](https://github.com/ctrox/csi-s3) - Kubernetes CSI driver
+* [docker-s3fs-client](https://github.com/efrecon/docker-s3fs-client) - Docker image containing s3fs
 * [goofys](https://github.com/kahing/goofys) - similar to s3fs but has better performance and less POSIX compatibility
 * [s3backer](https://github.com/archiecobbs/s3backer) - mount an S3 bucket as a single file
 * [S3Proxy](https://github.com/gaul/s3proxy) - combine with s3fs to mount Backblaze B2, EMC Atmos, Microsoft Azure, and OpenStack Swift buckets
@@ -175,4 +188,3 @@ Generally S3 cannot offer the same performance or semantics as a local file syst
 Copyright (C) 2010 Randy Rizun <rrizun@gmail.com>
 
 Licensed under the GNU GPL version 2
-

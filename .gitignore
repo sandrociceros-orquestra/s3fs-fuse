@@ -41,7 +41,9 @@ config.log
 config.status
 config.sub
 configure
+configure~
 configure.scan
+configure.ac~
 depcomp
 install-sh
 libtool
@@ -55,6 +57,11 @@ Makefile.in
 test-driver
 compile
 missing
+
+#
+# man page
+#
+doc/man/s3fs.1
 
 #
 # object directories
@@ -73,13 +80,36 @@ missing
 *.trs
 default_commit_hash
 src/s3fs
+src/test_auth
+src/test_cache_node
+src/test_cred_ibm
 src/test_curl_util
+src/test_metaheader
 src/test_page_list
+src/test_s3objlist
 src/test_string_util
+
 test/chaos-http-proxy-*
 test/junk_data
+test/pjdfstest
+test/pjd-pjdfstest-*
 test/s3proxy-*
 test/write_multiblock
+test/mknod_test
+test/truncate_read_file
+test/path_truncate
+test/cr_filename
+test/unlink_open_file
+test/rename_onto_open_file
+
+#
+# Windows ports
+#
+*.dll
+*.exe
+fuse.pc
+WinFsp/
+bin/
 
 #
 # Local variables:

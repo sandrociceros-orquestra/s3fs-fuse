@@ -24,6 +24,17 @@ if USE_GNUTLS_NETTLE
     AM_CPPFLAGS += -DUSE_GNUTLS_NETTLE
 endif
 
+AUTH_SOURCES =
+if USE_SSL_OPENSSL
+    AUTH_SOURCES += openssl_auth.cpp
+endif
+if USE_SSL_GNUTLS
+    AUTH_SOURCES += gnutls_auth.cpp
+endif
+if USE_SSL_NSS
+    AUTH_SOURCES += nss_auth.cpp
+endif
+
 s3fs_SOURCES = \
     s3fs.cpp \
     s3fs_global.cpp \
@@ -32,16 +43,17 @@ s3fs_SOURCES = \
     s3fs_xml.cpp \
     metaheader.cpp \
     mpu_util.cpp \
-    mvnode.cpp \
     curl.cpp \
-    curl_handlerpool.cpp \
-    curl_multi.cpp \
+    curl_share.cpp \
     curl_util.cpp \
-    bodydata.cpp \
     s3objlist.cpp \
     cache.cpp \
+    cache_node.cpp \
     string_util.cpp \
+    s3fs_cred.cpp \
+    s3fs_cred_ibm.cpp \
     s3fs_util.cpp \
+    s3fs_threadreqs.cpp \
     fdcache.cpp \
     fdcache_entity.cpp \
     fdcache_page.cpp \
@@ -50,39 +62,68 @@ s3fs_SOURCES = \
     fdcache_fdinfo.cpp \
     fdcache_pseudofd.cpp \
     fdcache_untreated.cpp \
+    filetimes.cpp \
     addhead.cpp \
     sighandlers.cpp \
-    autolock.cpp \
-    common_auth.cpp
-if USE_SSL_OPENSSL
-    s3fs_SOURCES += openssl_auth.cpp
-endif
-if USE_SSL_GNUTLS
-    s3fs_SOURCES += gnutls_auth.cpp
-endif
-if USE_SSL_NSS
-    s3fs_SOURCES += nss_auth.cpp
-endif
+    threadpoolman.cpp \
+    syncfiller.cpp \
+    common_auth.cpp \
+    $(AUTH_SOURCES)
 
 s3fs_LDADD = $(DEPS_LIBS)
 
 noinst_PROGRAMS = \
+    test_auth \
+    test_cache_node \
+    test_cred_ibm \
     test_curl_util \
+    test_metaheader \
     test_page_list \
+    test_s3objlist \
     test_string_util
 
-test_curl_util_SOURCES = common_auth.cpp curl_util.cpp string_util.cpp test_curl_util.cpp s3fs_global.cpp s3fs_logger.cpp
-if USE_SSL_OPENSSL
-    test_curl_util_SOURCES += openssl_auth.cpp
-endif
-if USE_SSL_GNUTLS
-    test_curl_util_SOURCES += gnutls_auth.cpp
-endif
-if USE_SSL_NSS
-    test_curl_util_SOURCES += nss_auth.cpp
-endif
+test_auth_SOURCES = \
+    common_auth.cpp \
+    string_util.cpp \
+    test_auth.cpp \
+    s3fs_global.cpp \
+    s3fs_logger.cpp \
+    $(AUTH_SOURCES)
+
+test_auth_LDADD = $(DEPS_LIBS)
+
+test_curl_util_SOURCES = \
+    common_auth.cpp \
+    curl_util.cpp \
+    string_util.cpp \
+    test_curl_util.cpp \
+    s3fs_global.cpp \
+    s3fs_logger.cpp \
+    $(AUTH_SOURCES)
 
 test_curl_util_LDADD = $(DEPS_LIBS)
+
+test_cred_ibm_SOURCES = \
+    common_auth.cpp \
+    curl_util.cpp \
+    s3fs_cred_ibm.cpp \
+    s3fs_global.cpp \
+    s3fs_logger.cpp \
+    string_util.cpp \
+    test_cred_ibm.cpp \
+    $(AUTH_SOURCES)
+
+test_cred_ibm_LDADD = $(DEPS_LIBS)
+
+test_cache_node_SOURCES = \
+    cache_node.cpp \
+    filetimes.cpp \
+    metaheader.cpp \
+    s3fs_global.cpp \
+    s3fs_logger.cpp \
+    s3objlist.cpp \
+    string_util.cpp \
+    test_cache_node.cpp
 
 test_page_list_SOURCES = \
     fdcache_page.cpp \
@@ -91,21 +132,37 @@ test_page_list_SOURCES = \
     string_util.cpp \
     test_page_list.cpp
 
+test_s3objlist_SOURCES = s3objlist.cpp test_s3objlist.cpp
+
 test_string_util_SOURCES = string_util.cpp test_string_util.cpp s3fs_logger.cpp
 
+test_metaheader_SOURCES = \
+    metaheader.cpp \
+    filetimes.cpp \
+    string_util.cpp \
+    s3fs_logger.cpp \
+    test_metaheader.cpp
+
 TESTS = \
+    test_auth \
+    test_cache_node \
+    test_cred_ibm \
     test_curl_util \
+    test_metaheader \
     test_page_list \
+    test_s3objlist \
     test_string_util
 
 clang-tidy:
-	clang-tidy $(s3fs_SOURCES) -- $(DEPS_CFLAGS) $(CPPFLAGS)
+	clang-tidy -extra-arg-before=-xc++ -extra-arg=-std=@CPP_VERSION@ -header-filter= \
+		*.h $(s3fs_SOURCES) test_auth.cpp test_cache_node.cpp test_cred_ibm.cpp test_curl_util.cpp test_metaheader.cpp test_page_list.cpp test_s3objlist.cpp test_string_util.cpp \
+		-- $(DEPS_CFLAGS) $(CPPFLAGS)
 
 #
 # Local variables:
 # tab-width: 4
 # c-basic-offset: 4
 # End:
-# vim600: expandtab sw=4 ts= fdm=marker
-# vim<600: expandtab sw=4 ts=4
+# vim600: noexpandtab sw=4 ts=4 fdm=marker
+# vim<600: noexpandtab sw=4 ts=4
 #

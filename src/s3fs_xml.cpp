@@ -20,22 +20,33 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <libxml/xpathInternals.h>
+#include <mutex>
+#include <string>
 
 #include "common.h"
-#include "s3fs.h"
+#include "s3fs_logger.h"
 #include "s3fs_xml.h"
 #include "s3fs_util.h"
-#include "autolock.h"
+#include "s3objlist.h"
+#include "string_util.h"
+
+//-------------------------------------------------------------------
+// Symbols
+//-------------------------------------------------------------------
+enum class get_object_name_result : std::uint8_t {
+    SUCCESS,
+    FAILURE,
+    FILE_OR_SUBDIR_IN_DIR
+};
 
 //-------------------------------------------------------------------
 // Variables
 //-------------------------------------------------------------------
-static const char c_strErrorObjectName[] = "FILE or SUBDIR in DIR";
-
 // [NOTE]
 // mutex for static variables in GetXmlNsUrl
 //
-static pthread_mutex_t* pxml_parser_mutex = NULL;
+static std::mutex xml_parser_mutex;
 
 //-------------------------------------------------------------------
 // Functions
@@ -44,7 +55,7 @@ static bool GetXmlNsUrl(xmlDocPtr doc, std::string& nsurl)
 {
     bool result = false;
 
-    if(!pxml_parser_mutex || !doc){
+    if(!doc){
         return result;
     }
 
@@ -53,23 +64,22 @@ static bool GetXmlNsUrl(xmlDocPtr doc, std::string& nsurl)
         static time_t tmLast = 0;  // cache for 60 sec.
         static std::string strNs;
 
-        AutoLock lock(pxml_parser_mutex);
+        const std::lock_guard<std::mutex> lock(xml_parser_mutex);
 
-        if((tmLast + 60) < time(NULL)){
+        if((tmLast + 60) < time(nullptr)){
             // refresh
-            tmLast = time(NULL);
+            tmLast = time(nullptr);
             strNs  = "";
             xmlNodePtr pRootNode = xmlDocGetRootElement(doc);
             if(pRootNode){
-                xmlNsPtr* nslist = xmlGetNsList(doc, pRootNode);
+                std::unique_ptr<xmlNsPtr, decltype(xmlFree)> nslist(xmlGetNsList(doc, pRootNode), xmlFree);
                 if(nslist){
-                    if(nslist[0] && nslist[0]->href){
-                        int len = xmlStrlen(nslist[0]->href);
+                    if(*nslist && (*nslist)[0].href){
+                        int len = xmlStrlen((*nslist)[0].href);
                         if(0 < len){
-                            strNs = std::string((const char*)(nslist[0]->href), len);
+                            strNs = std::string(reinterpret_cast<const char*>((*nslist)[0].href), len);
                         }
                     }
-                    S3FS_XMLFREE(nslist);
                 }
             }
         }
@@ -82,19 +92,18 @@ static bool GetXmlNsUrl(xmlDocPtr doc, std::string& nsurl)
     return result;
 }
 
-static xmlChar* get_base_exp(xmlDocPtr doc, const char* exp)
+static unique_ptr_xmlChar get_base_exp(xmlDocPtr doc, const char* exp)
 {
-    xmlXPathObjectPtr  marker_xp;
     std::string xmlnsurl;
     std::string exp_string;
 
     if(!doc){
-        return NULL;
+        return {nullptr, xmlFree};
     }
-    xmlXPathContextPtr ctx = xmlXPathNewContext(doc);
+    unique_ptr_xmlXPathContext ctx(xmlXPathNewContext(doc), xmlXPathFreeContext);
 
     if(!noxmlns && GetXmlNsUrl(doc, xmlnsurl)){
-        xmlXPathRegisterNs(ctx, (xmlChar*)"s3", (xmlChar*)xmlnsurl.c_str());
+        xmlXPathRegisterNs(ctx.get(), reinterpret_cast<const xmlChar*>("s3"), reinterpret_cast<const xmlChar*>(xmlnsurl.c_str()));
         exp_string = "/s3:ListBucketResult/s3:";
     } else {
         exp_string = "/ListBucketResult/";
@@ -102,91 +111,81 @@ static xmlChar* get_base_exp(xmlDocPtr doc, const char* exp)
 
     exp_string += exp;
 
-    if(NULL == (marker_xp = xmlXPathEvalExpression((xmlChar *)exp_string.c_str(), ctx))){
-        xmlXPathFreeContext(ctx);
-        return NULL;
+    unique_ptr_xmlXPathObject marker_xp(xmlXPathEvalExpression(reinterpret_cast<const xmlChar*>(exp_string.c_str()), ctx.get()), xmlXPathFreeObject);
+    if(nullptr == marker_xp){
+        return {nullptr, xmlFree};
     }
     if(xmlXPathNodeSetIsEmpty(marker_xp->nodesetval)){
-        S3FS_PRN_ERR("marker_xp->nodesetval is empty.");
-        xmlXPathFreeObject(marker_xp);
-        xmlXPathFreeContext(ctx);
-        return NULL;
+        S3FS_PRN_INFO("marker_xp->nodesetval is empty.");
+        return {nullptr, xmlFree};
     }
     xmlNodeSetPtr nodes  = marker_xp->nodesetval;
-    xmlChar*      result = xmlNodeListGetString(doc, nodes->nodeTab[0]->xmlChildrenNode, 1);
 
-    xmlXPathFreeObject(marker_xp);
-    xmlXPathFreeContext(ctx);
-
+    unique_ptr_xmlChar result(xmlNodeListGetString(doc, nodes->nodeTab[0]->xmlChildrenNode, 1), xmlFree);
     return result;
 }
 
-static xmlChar* get_prefix(xmlDocPtr doc)
+static unique_ptr_xmlChar get_prefix(xmlDocPtr doc)
 {
     return get_base_exp(doc, "Prefix");
 }
 
-xmlChar* get_next_continuation_token(xmlDocPtr doc)
+unique_ptr_xmlChar get_next_continuation_token(xmlDocPtr doc)
 {
     return get_base_exp(doc, "NextContinuationToken");
 }
 
-xmlChar* get_next_marker(xmlDocPtr doc)
+unique_ptr_xmlChar get_next_marker(xmlDocPtr doc)
 {
     return get_base_exp(doc, "NextMarker");
 }
 
-// return: the pointer to object name on allocated memory.
-//         the pointer to "c_strErrorObjectName".(not allocated)
-//         NULL(a case of something error occurred)
-static char* get_object_name(xmlDocPtr doc, xmlNodePtr node, const char* path)
+static std::pair<get_object_name_result, std::string> get_object_name(xmlDocPtr doc, xmlNodePtr node, const char* path)
 {
     // Get full path
-    xmlChar* fullpath = xmlNodeListGetString(doc, node, 1);
+    unique_ptr_xmlChar fullpath(xmlNodeListGetString(doc, node, 1), xmlFree);
     if(!fullpath){
         S3FS_PRN_ERR("could not get object full path name..");
-        return NULL;
+        return {get_object_name_result::FAILURE, ""};
     }
     // basepath(path) is as same as fullpath.
-    if(0 == strcmp((char*)fullpath, path)){
-        xmlFree(fullpath);
-        return (char*)c_strErrorObjectName;
+    if(0 == strcmp(reinterpret_cast<char*>(fullpath.get()), path)){
+        return {get_object_name_result::FILE_OR_SUBDIR_IN_DIR, ""};
     }
 
     // Make dir path and filename
-    std::string   strdirpath = mydirname(std::string((char*)fullpath));
-    std::string   strmybpath = mybasename(std::string((char*)fullpath));
+    std::string strdirpath = mydirname(reinterpret_cast<const char*>(fullpath.get()));
+    std::string strmybpath = mybasename(reinterpret_cast<const char*>(fullpath.get()));
     const char* dirpath = strdirpath.c_str();
     const char* mybname = strmybpath.c_str();
     const char* basepath= (path && '/' == path[0]) ? &path[1] : path;
-    xmlFree(fullpath);
 
-    if(!mybname || '\0' == mybname[0]){
-        return NULL;
+    if('\0' == mybname[0]){
+        return {get_object_name_result::FAILURE, ""};
     }
 
     // check subdir & file in subdir
-    if(dirpath && 0 < strlen(dirpath)){
+    if(0 < strlen(dirpath)){
         // case of "/"
         if(0 == strcmp(mybname, "/") && 0 == strcmp(dirpath, "/")){
-            return (char*)c_strErrorObjectName;
+            return {get_object_name_result::FILE_OR_SUBDIR_IN_DIR, ""};
         }
         // case of "."
         if(0 == strcmp(mybname, ".") && 0 == strcmp(dirpath, ".")){
-            return (char*)c_strErrorObjectName;
+            return {get_object_name_result::FILE_OR_SUBDIR_IN_DIR, ""};
         }
         // case of ".."
         if(0 == strcmp(mybname, "..") && 0 == strcmp(dirpath, ".")){
-            return (char*)c_strErrorObjectName;
+            return {get_object_name_result::FILE_OR_SUBDIR_IN_DIR, ""};
         }
         // case of "name"
         if(0 == strcmp(dirpath, ".")){
             // OK
-            return strdup(mybname);
+            return {get_object_name_result::SUCCESS, mybname};
         }else{
             if(basepath && 0 == strcmp(dirpath, basepath)){
                 // OK
-                return strdup(mybname);
+                return {get_object_name_result::SUCCESS, mybname};
             }else if(basepath && 0 < strlen(basepath) && '/' == basepath[strlen(basepath) - 1] && 0 == strncmp(dirpath, basepath, strlen(basepath) - 1)){
                 std::string withdirname;
                 if(strlen(dirpath) > strlen(basepath)){
@@ -198,43 +197,40 @@ static char* get_object_name(xmlDocPtr doc, xmlNodePtr node, const char* path)
                     withdirname += "/";
                 }
                 withdirname += mybname;
-                return strdup(withdirname.c_str());
+                return {get_object_name_result::SUCCESS, withdirname};
             }
         }
     }
     // case of something wrong
-    return (char*)c_strErrorObjectName;
+    return {get_object_name_result::FILE_OR_SUBDIR_IN_DIR, ""};
 }
 
-static xmlChar* get_exp_value_xml(xmlDocPtr doc, xmlXPathContextPtr ctx, const char* exp_key)
+static unique_ptr_xmlChar get_exp_value_xml(xmlDocPtr doc, xmlXPathContextPtr ctx, const char* exp_key)
 {
     if(!doc || !ctx || !exp_key){
-        return NULL;
+        return {nullptr, xmlFree};
     }
 
-    xmlXPathObjectPtr exp;
     xmlNodeSetPtr     exp_nodes;
-    xmlChar*          exp_value;
 
     // search exp_key tag
-    if(NULL == (exp = xmlXPathEvalExpression((xmlChar*)exp_key, ctx))){
+    unique_ptr_xmlXPathObject exp(xmlXPathEvalExpression(reinterpret_cast<const xmlChar*>(exp_key), ctx), xmlXPathFreeObject);
+    if(nullptr == exp){
         S3FS_PRN_ERR("Could not find key(%s).", exp_key);
-        return NULL;
+        return {nullptr, xmlFree};
     }
     if(xmlXPathNodeSetIsEmpty(exp->nodesetval)){
         S3FS_PRN_ERR("Key(%s) node is empty.", exp_key);
-        S3FS_XMLXPATHFREEOBJECT(exp);
-        return NULL;
+        return {nullptr, xmlFree};
     }
     // get exp_key value & set in struct
     exp_nodes = exp->nodesetval;
-    if(NULL == (exp_value = xmlNodeListGetString(doc, exp_nodes->nodeTab[0]->xmlChildrenNode, 1))){
+    unique_ptr_xmlChar exp_value(xmlNodeListGetString(doc, exp_nodes->nodeTab[0]->xmlChildrenNode, 1), xmlFree);
+    if(nullptr == exp_value){
         S3FS_PRN_ERR("Key(%s) value is empty.", exp_key);
-        S3FS_XMLXPATHFREEOBJECT(exp);
-        return NULL;
+        return {nullptr, xmlFree};
     }
 
-    S3FS_XMLXPATHFREEOBJECT(exp);
     return exp_value;
 }
 
@@ -244,7 +240,7 @@ bool get_incomp_mpu_list(xmlDocPtr doc, incomp_mpu_list_t& list)
         return false;
     }
 
-    xmlXPathContextPtr ctx = xmlXPathNewContext(doc);;
+    unique_ptr_xmlXPathContext ctx(xmlXPathNewContext(doc), xmlXPathFreeContext);
 
     std::string xmlnsurl;
     std::string ex_upload = "//";
@@ -253,7 +249,7 @@ bool get_incomp_mpu_list(xmlDocPtr doc, incomp_mpu_list_t& list)
     std::string ex_date;
 
     if(!noxmlns && GetXmlNsUrl(doc, xmlnsurl)){
-        xmlXPathRegisterNs(ctx, (xmlChar*)"s3", (xmlChar*)xmlnsurl.c_str());
+        xmlXPathRegisterNs(ctx.get(), reinterpret_cast<const xmlChar*>("s3"), reinterpret_cast<const xmlChar*>(xmlnsurl.c_str()));
         ex_upload += "s3:";
         ex_key    += "s3:";
         ex_id     += "s3:";
@@ -265,15 +261,13 @@ bool get_incomp_mpu_list(xmlDocPtr doc, incomp_mpu_list_t& list)
     ex_date   += "Initiated";
 
     // get "Upload" Tags
-    xmlXPathObjectPtr  upload_xp;
-    if(NULL == (upload_xp = xmlXPathEvalExpression((xmlChar*)ex_upload.c_str(), ctx))){
+    unique_ptr_xmlXPathObject upload_xp(xmlXPathEvalExpression(reinterpret_cast<const xmlChar*>(ex_upload.c_str()), ctx.get()), xmlXPathFreeObject);
+    if(nullptr == upload_xp){
         S3FS_PRN_ERR("xmlXPathEvalExpression returns null.");
         return false;
     }
     if(xmlXPathNodeSetIsEmpty(upload_xp->nodesetval)){
         S3FS_PRN_INFO("upload_xp->nodesetval is empty.");
-        S3FS_XMLXPATHFREEOBJECT(upload_xp);
-        S3FS_XMLXPATHFREECONTEXT(ctx);
         return true;
     }
 
@@ -285,133 +279,160 @@ bool get_incomp_mpu_list(xmlDocPtr doc, incomp_mpu_list_t& list)
         ctx->node = upload_nodes->nodeTab[cnt];
 
         INCOMP_MPU_INFO part;
-        xmlChar*        ex_value;
 
         // search "Key" tag
-        if(NULL == (ex_value = get_exp_value_xml(doc, ctx, ex_key.c_str()))){
+        unique_ptr_xmlChar ex_value(get_exp_value_xml(doc, ctx.get(), ex_key.c_str()));
+        if(nullptr == ex_value){
             continue;
         }
-        if('/' != *((char*)ex_value)){
+        if('/' != *(reinterpret_cast<char*>(ex_value.get()))){
             part.key = "/";
         }else{
             part.key = "";
         }
-        part.key += (char*)ex_value;
-        S3FS_XMLFREE(ex_value);
+        part.key += reinterpret_cast<char*>(ex_value.get());
 
         // search "UploadId" tag
-        if(NULL == (ex_value = get_exp_value_xml(doc, ctx, ex_id.c_str()))){
+        if(nullptr == (ex_value = get_exp_value_xml(doc, ctx.get(), ex_id.c_str()))){
             continue;
         }
-        part.id = (char*)ex_value;
-        S3FS_XMLFREE(ex_value);
+        part.id = reinterpret_cast<char*>(ex_value.get());
 
         // search "Initiated" tag
-        if(NULL == (ex_value = get_exp_value_xml(doc, ctx, ex_date.c_str()))){
+        if(nullptr == (ex_value = get_exp_value_xml(doc, ctx.get(), ex_date.c_str()))){
             continue;
         }
-        part.date = (char*)ex_value;
-        S3FS_XMLFREE(ex_value);
+        part.date = reinterpret_cast<char*>(ex_value.get());
 
         list.push_back(part);
     }
-
-    S3FS_XMLXPATHFREEOBJECT(upload_xp);
-    S3FS_XMLXPATHFREECONTEXT(ctx);
 
     return true;
 }
 
 bool is_truncated(xmlDocPtr doc)
 {
-    bool result = false;
-
-    xmlChar* strTruncate = get_base_exp(doc, "IsTruncated");
+    unique_ptr_xmlChar strTruncate(get_base_exp(doc, "IsTruncated"));
     if(!strTruncate){
         return false;
     }
-    if(0 == strcasecmp((const char*)strTruncate, "true")){
-        result = true;
-    }
-    xmlFree(strTruncate);
-    return result;
+    return 0 == strcasecmp(reinterpret_cast<const char*>(strTruncate.get()), "true");
 }
 
-int append_objects_from_xml_ex(const char* path, xmlDocPtr doc, xmlXPathContextPtr ctx, const char* ex_contents, const char* ex_key, const char* ex_etag, int isCPrefix, S3ObjList& head)
+int append_objects_from_xml_ex(const char* path, xmlDocPtr doc, xmlXPathContextPtr ctx, const char* ex_contents, const char* ex_key, const char* ex_etag, const char* ex_size, const char* ex_lastmod, int isCPrefix, S3ObjList& head, bool prefix)
 {
-    xmlXPathObjectPtr contents_xp;
     xmlNodeSetPtr content_nodes;
 
-    if(NULL == (contents_xp = xmlXPathEvalExpression((xmlChar*)ex_contents, ctx))){
+    unique_ptr_xmlXPathObject contents_xp(xmlXPathEvalExpression(reinterpret_cast<const xmlChar*>(ex_contents), ctx), xmlXPathFreeObject);
+    if(nullptr == contents_xp){
         S3FS_PRN_ERR("xmlXPathEvalExpression returns null.");
         return -1;
     }
     if(xmlXPathNodeSetIsEmpty(contents_xp->nodesetval)){
         S3FS_PRN_DBG("contents_xp->nodesetval is empty.");
-        S3FS_XMLXPATHFREEOBJECT(contents_xp);
         return 0;
     }
     content_nodes = contents_xp->nodesetval;
 
     bool is_dir;
     std::string stretag;
+    std::string strlastmod;
+    off_t       objsize;
     int i;
     for(i = 0; i < content_nodes->nodeNr; i++){
         ctx->node = content_nodes->nodeTab[i];
 
         // object name
-        xmlXPathObjectPtr key;
-        if(NULL == (key = xmlXPathEvalExpression((xmlChar*)ex_key, ctx))){
+        unique_ptr_xmlXPathObject key(xmlXPathEvalExpression(reinterpret_cast<const xmlChar*>(ex_key), ctx), xmlXPathFreeObject);
+        if(nullptr == key){
             S3FS_PRN_WARN("key is null. but continue.");
             continue;
         }
         if(xmlXPathNodeSetIsEmpty(key->nodesetval)){
             S3FS_PRN_WARN("node is empty. but continue.");
-            xmlXPathFreeObject(key);
             continue;
         }
         xmlNodeSetPtr key_nodes = key->nodesetval;
-        char* name = get_object_name(doc, key_nodes->nodeTab[0]->xmlChildrenNode, path);
+        auto [name_result, name] = get_object_name(doc, key_nodes->nodeTab[0]->xmlChildrenNode, path);
 
-        if(!name){
+        switch(name_result){
+        case get_object_name_result::FAILURE:
             S3FS_PRN_WARN("name is something wrong. but continue.");
-
-        }else if((const char*)name != c_strErrorObjectName){
-            is_dir  = isCPrefix ? true : false;
-            stretag = "";
+            break;
+        case get_object_name_result::SUCCESS: {
+            is_dir     = isCPrefix ? true : false;
+            stretag    = "";
+            strlastmod = "";
+            objsize    = -1;
 
             if(!isCPrefix && ex_etag){
                 // Get ETag
-                xmlXPathObjectPtr ETag;
-                if(NULL != (ETag = xmlXPathEvalExpression((xmlChar*)ex_etag, ctx))){
+                unique_ptr_xmlXPathObject ETag(xmlXPathEvalExpression(reinterpret_cast<const xmlChar*>(ex_etag), ctx), xmlXPathFreeObject);
+                if(nullptr != ETag){
                     if(xmlXPathNodeSetIsEmpty(ETag->nodesetval)){
                         S3FS_PRN_INFO("ETag->nodesetval is empty.");
                     }else{
                         xmlNodeSetPtr etag_nodes = ETag->nodesetval;
-                        xmlChar* petag = xmlNodeListGetString(doc, etag_nodes->nodeTab[0]->xmlChildrenNode, 1);
+                        unique_ptr_xmlChar petag(xmlNodeListGetString(doc, etag_nodes->nodeTab[0]->xmlChildrenNode, 1), xmlFree);
                         if(petag){
-                            stretag = (char*)petag;
-                            xmlFree(petag);
+                            stretag = reinterpret_cast<const char*>(petag.get());
                         }
                     }
-                    xmlXPathFreeObject(ETag);
                 }
             }
-            if(!head.insert(name, (!stretag.empty() ? stretag.c_str() : NULL), is_dir)){
+
+            if(!isCPrefix && ex_size){
+                // Get Size
+                unique_ptr_xmlXPathObject Size(xmlXPathEvalExpression(reinterpret_cast<const xmlChar*>(ex_size), ctx), xmlXPathFreeObject);
+                if(nullptr != Size){
+                    if(xmlXPathNodeSetIsEmpty(Size->nodesetval)){
+                        S3FS_PRN_INFO("Size->nodesetval is empty.");
+                    }else{
+                        xmlNodeSetPtr size_nodes = Size->nodesetval;
+                        unique_ptr_xmlChar psize(xmlNodeListGetString(doc, size_nodes->nodeTab[0]->xmlChildrenNode, 1), xmlFree);
+                        if(psize){
+                            objsize = cvt_strtoofft(reinterpret_cast<const char*>(psize.get()), /*base=*/ 10);
+                        }
+                    }
+                }
+            }
+
+            if(!isCPrefix && ex_lastmod){
+                // Get LastModified
+                unique_ptr_xmlXPathObject LastModified(xmlXPathEvalExpression(reinterpret_cast<const xmlChar*>(ex_lastmod), ctx), xmlXPathFreeObject);
+                if(nullptr != LastModified){
+                    if(xmlXPathNodeSetIsEmpty(LastModified->nodesetval)){
+                        S3FS_PRN_INFO("LastModified->nodesetval is empty.");
+                    }else{
+                        xmlNodeSetPtr lastmod_nodes = LastModified->nodesetval;
+                        unique_ptr_xmlChar plastmod(xmlNodeListGetString(doc, lastmod_nodes->nodeTab[0]->xmlChildrenNode, 1), xmlFree);
+                        if(plastmod){
+                            strlastmod = reinterpret_cast<const char*>(plastmod.get());
+                        }
+                    }
+                }
+            }
+
+            // [NOTE]
+            // The XML data passed to this function is CR code(\r) encoded.
+            // The function below decodes that encoded CR code.
+            //
+            std::string decname = get_decoded_cr_code(name.c_str());
+
+            if(prefix){
+                head.AddCommonPrefix(decname);
+            }
+            if(!head.insert(decname.c_str(), (!stretag.empty() ? stretag.c_str() : nullptr), is_dir, objsize, (!strlastmod.empty() ? strlastmod.c_str() : nullptr))){
                 S3FS_PRN_ERR("insert_object returns with error.");
-                xmlXPathFreeObject(key);
-                xmlXPathFreeObject(contents_xp);
-                free(name);
-                S3FS_MALLOCTRIM(0);
                 return -1;
             }
-            free(name);
-        }else{
-            S3FS_PRN_DBG("name is file or subdir in dir. but continue.");
+            break;
         }
-        xmlXPathFreeObject(key);
+        case get_object_name_result::FILE_OR_SUBDIR_IN_DIR:
+            S3FS_PRN_DBG("name is file or subdir in dir. but continue.");
+            break;
+        }
     }
-    S3FS_XMLXPATHFREEOBJECT(contents_xp);
 
     return 0;
 }
@@ -424,42 +445,43 @@ int append_objects_from_xml(const char* path, xmlDocPtr doc, S3ObjList& head)
     std::string ex_cprefix  = "//";
     std::string ex_prefix;
     std::string ex_etag;
+    std::string ex_size;
+    std::string ex_lastmod;
 
     if(!doc){
         return -1;
     }
 
     // If there is not <Prefix>, use path instead of it.
-    xmlChar* pprefix = get_prefix(doc);
-    std::string prefix  = (pprefix ? (char*)pprefix : path ? path : "");
-    if(pprefix){
-        xmlFree(pprefix);
-    }
+    auto pprefix = get_prefix(doc);
+    std::string prefix  = (pprefix ? reinterpret_cast<char*>(pprefix.get()) : path ? path : "");
 
-    xmlXPathContextPtr ctx = xmlXPathNewContext(doc);
+    unique_ptr_xmlXPathContext ctx(xmlXPathNewContext(doc), xmlXPathFreeContext);
 
     if(!noxmlns && GetXmlNsUrl(doc, xmlnsurl)){
-        xmlXPathRegisterNs(ctx, (xmlChar*)"s3", (xmlChar*)xmlnsurl.c_str());
+        xmlXPathRegisterNs(ctx.get(), reinterpret_cast<const xmlChar*>("s3"), reinterpret_cast<const xmlChar*>(xmlnsurl.c_str()));
         ex_contents+= "s3:";
         ex_key     += "s3:";
         ex_cprefix += "s3:";
         ex_prefix  += "s3:";
         ex_etag    += "s3:";
+        ex_size    += "s3:";
+        ex_lastmod += "s3:";
     }
     ex_contents+= "Contents";
     ex_key     += "Key";
     ex_cprefix += "CommonPrefixes";
     ex_prefix  += "Prefix";
     ex_etag    += "ETag";
+    ex_size    += "Size";
+    ex_lastmod += "LastModified";
 
-    if(-1 == append_objects_from_xml_ex(prefix.c_str(), doc, ctx, ex_contents.c_str(), ex_key.c_str(), ex_etag.c_str(), 0, head) ||
-       -1 == append_objects_from_xml_ex(prefix.c_str(), doc, ctx, ex_cprefix.c_str(), ex_prefix.c_str(), NULL, 1, head) )
+    if(-1 == append_objects_from_xml_ex(prefix.c_str(), doc, ctx.get(), ex_contents.c_str(), ex_key.c_str(), ex_etag.c_str(), ex_size.c_str(), ex_lastmod.c_str(), 0, head, /*prefix=*/ false) ||
+       -1 == append_objects_from_xml_ex(prefix.c_str(), doc, ctx.get(), ex_cprefix.c_str(), ex_prefix.c_str(), nullptr, nullptr, nullptr, 1, head, /*prefix=*/ true) )
     {
         S3FS_PRN_ERR("append_objects_from_xml_ex returns with error.");
-        S3FS_XMLXPATHFREECONTEXT(ctx);
         return -1;
     }
-    S3FS_XMLXPATHFREECONTEXT(ctx);
 
     return 0;
 }
@@ -467,25 +489,34 @@ int append_objects_from_xml(const char* path, xmlDocPtr doc, S3ObjList& head)
 //-------------------------------------------------------------------
 // Utility functions
 //-------------------------------------------------------------------
-bool simple_parse_xml(const char* data, size_t len, const char* key, std::string& value)
+std::optional<std::string> simple_parse_xml(const char* data, size_t len, const char* key)
 {
-    bool result = false;
-
-    if(!data || !key){
-        return false;
-    }
-    value.clear();
-
-    xmlDocPtr doc;
-    if(NULL == (doc = xmlReadMemory(data, static_cast<int>(len), "", NULL, 0))){
-        return false;
+    if(!data || !key || 0 == len){
+        return std::nullopt;
     }
 
-    if(NULL == doc->children){
-        S3FS_XMLFREEDOC(doc);
-        return false;
+    // [NOTE]
+    // If data is not nullptr and len is 0, this function will output the message
+    // ":1: parser error : Document is empty" to stderr.
+    // Make sure len is not 0 beforehand.
+    //
+    s3fsXmlBufferParserError parserError;
+    parserError.SetXmlParseError();
+
+    std::unique_ptr<xmlDoc, decltype(&xmlFreeDoc)> doc(xmlReadMemory(data, static_cast<int>(len), "", nullptr, S3FS_XML_PARSE_FLAGS), xmlFreeDoc);
+    if(nullptr == doc){
+        if(parserError.IsXmlParseError()){
+            S3FS_PRN_ERR("xmlReadMemory returns with error: %s", parserError.GetXmlParseError().c_str());
+        }else{
+            S3FS_PRN_ERR("xmlReadMemory returns with error.");
+        }
+        return std::nullopt;
     }
-    for(xmlNodePtr cur_node = doc->children->children; NULL != cur_node; cur_node = cur_node->next){
+
+    if(nullptr == doc->children){
+        return std::nullopt;
+    }
+    for(xmlNodePtr cur_node = doc->children->children; nullptr != cur_node; cur_node = cur_node->next){
         // For DEBUG
         // std::string cur_node_name(reinterpret_cast<const char *>(cur_node->name));
         // printf("cur_node_name: %s\n", cur_node_name.c_str());
@@ -498,55 +529,14 @@ bool simple_parse_xml(const char* data, size_t len, const char* key, std::string
             if(cur_node->children){
                 if(XML_TEXT_NODE == cur_node->children->type){
                     if(elementName == key) {
-                        value = reinterpret_cast<const char *>(cur_node->children->content);
-                        result    = true;
-                        break;
+                        return std::string(reinterpret_cast<const char *>(cur_node->children->content));
                     }
                 }
             }
         }
     }
-    S3FS_XMLFREEDOC(doc);
 
-    return result;
-}
-
-//-------------------------------------------------------------------
-// Utility for lock
-//-------------------------------------------------------------------
-bool init_parser_xml_lock()
-{
-    if(pxml_parser_mutex){
-        return false;
-    }
-    pxml_parser_mutex = new pthread_mutex_t;
-
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-#if S3FS_PTHREAD_ERRORCHECK
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
-#endif
-
-    if(0 != pthread_mutex_init(pxml_parser_mutex, &attr)){
-        delete pxml_parser_mutex;
-        pxml_parser_mutex = NULL;
-        return false;
-    }
-    return true;
-}
-
-bool destroy_parser_xml_lock()
-{
-    if(!pxml_parser_mutex){
-        return false;
-    }
-    if(0 != pthread_mutex_destroy(pxml_parser_mutex)){
-        return false;
-    }
-    delete pxml_parser_mutex;
-    pxml_parser_mutex = NULL;
-
-    return true;
+    return std::nullopt;
 }
 
 /*

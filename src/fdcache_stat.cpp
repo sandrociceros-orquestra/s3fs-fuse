@@ -18,17 +18,17 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#include <cstdio>
-#include <cstdlib>
 #include <cerrno>
 #include <unistd.h>
+#include <string>
 #include <sys/file.h>
+#include <sys/stat.h>
 
-#include "common.h"
-#include "s3fs.h"
+#include "s3fs_logger.h"
 #include "fdcache_stat.h"
 #include "fdcache.h"
 #include "s3fs_util.h"
+#include "s3fs_cred.h"
 #include "string_util.h"
 
 //------------------------------------------------
@@ -37,31 +37,31 @@
 std::string CacheFileStat::GetCacheFileStatTopDir()
 {
     std::string top_path;
-    if(!FdManager::IsCacheDir() || bucket.empty()){
+    if(!FdManager::IsCacheDir() || S3fsCred::GetBucket().empty()){
         return top_path;
     }
 
     // stat top dir( "/<cache_dir>/.<bucket_name>.stat" )
     top_path += FdManager::GetCacheDir();
     top_path += "/.";
-    top_path += bucket;
+    top_path += S3fsCred::GetBucket();
     top_path += ".stat";
     return top_path;
 }
 
-bool CacheFileStat::MakeCacheFileStatPath(const char* path, std::string& sfile_path, bool is_create_dir)
+int CacheFileStat::MakeCacheFileStatPath(const char* path, std::string& sfile_path, bool is_create_dir)
 {
     std::string top_path = CacheFileStat::GetCacheFileStatTopDir();
     if(top_path.empty()){
         S3FS_PRN_ERR("The path to cache top dir is empty.");
-        return false;
+        return -EIO;
     }
 
     if(is_create_dir){
       int result;
-      if(0 != (result = mkdirp(top_path + mydirname(path), 0777))){
+      if(0 != (result = mkdirp(top_path + mydirname(path), 0700))){
           S3FS_PRN_ERR("failed to create dir(%s) by errno(%d).", path, result);
-          return false;
+          return result;
       }
     }
     if(!path || '\0' == path[0]){
@@ -69,7 +69,7 @@ bool CacheFileStat::MakeCacheFileStatPath(const char* path, std::string& sfile_p
     }else{
         sfile_path = top_path + SAFESTRPTR(path);
     }
-    return true;
+    return 0;
 }
 
 bool CacheFileStat::CheckCacheFileStatTopDir()
@@ -83,26 +83,28 @@ bool CacheFileStat::CheckCacheFileStatTopDir()
     return check_exist_dir_permission(top_path.c_str());
 }
 
-bool CacheFileStat::DeleteCacheFileStat(const char* path)
+int CacheFileStat::DeleteCacheFileStat(const char* path)
 {
     if(!path || '\0' == path[0]){
-        return false;
+        return -EINVAL;
     }
     // stat path
     std::string sfile_path;
-    if(!CacheFileStat::MakeCacheFileStatPath(path, sfile_path, false)){
+    int result;
+    if(0 != (result = CacheFileStat::MakeCacheFileStatPath(path, sfile_path, false))){
         S3FS_PRN_ERR("failed to create cache stat file path(%s)", path);
-        return false;
+        return result;
     }
     if(0 != unlink(sfile_path.c_str())){
-        if(ENOENT == errno){
-            S3FS_PRN_DBG("failed to delete file(%s): errno=%d", path, errno);
+        result = -errno;
+        if(-ENOENT == result){
+            S3FS_PRN_DBG("failed to delete file(%s): errno=%d", path, result);
         }else{
-            S3FS_PRN_ERR("failed to delete file(%s): errno=%d", path, errno);
+            S3FS_PRN_ERR("failed to delete file(%s): errno=%d", path, result);
         }
-        return false;
+        return result;
     }
-    return true;
+    return 0;
 }
 
 // [NOTE]
@@ -128,7 +130,7 @@ bool CacheFileStat::RenameCacheFileStat(const char* oldpath, const char* newpath
     // stat path
     std::string old_filestat;
     std::string new_filestat;
-    if(!CacheFileStat::MakeCacheFileStatPath(oldpath, old_filestat, false) || !CacheFileStat::MakeCacheFileStatPath(newpath, new_filestat, false)){
+    if(0 != CacheFileStat::MakeCacheFileStatPath(oldpath, old_filestat, false) || 0 != CacheFileStat::MakeCacheFileStatPath(newpath, new_filestat, false)){
         return false;
     }
 
@@ -172,7 +174,8 @@ CacheFileStat::CacheFileStat(const char* tpath) : fd(-1)
 
 CacheFileStat::~CacheFileStat()
 {
-    Release();
+    // Ignore the result since Release logs errors and the destructor cannot handle them.
+    static_cast<void>(Release());
 }
 
 bool CacheFileStat::SetPath(const char* tpath, bool is_open)
@@ -191,6 +194,44 @@ bool CacheFileStat::SetPath(const char* tpath, bool is_open)
     return Open();
 }
 
+// [NOTE]
+// There is no need to check whether the file is open because using rename().
+//
+bool CacheFileStat::OverWriteFile(const std::string& strall) const
+{
+    // make temporary file path(in same cache directory)
+    std::string sfile_path;
+    if(0 != CacheFileStat::MakeCacheFileStatPath(path.c_str(), sfile_path, true)){
+        S3FS_PRN_ERR("failed to create cache stat file path(%s)", path.c_str());
+        return false;
+    }
+    std::string strTmpFile = mydirname(sfile_path) + "/.tmpstat.XXXXXX";
+    strTmpFile.push_back('\0');     // terminate with a null character and allocate space for it.
+
+    // open temporary file(mode: 0600)
+    int tmpfd;
+    if(-1 == (tmpfd = mkstemp(strTmpFile.data()))){
+        S3FS_PRN_ERR("failed to create temporary cache stat file path(%s) for %s cache", strTmpFile.c_str(), sfile_path.c_str());
+        return false;
+    }
+
+    // write contents
+    if(0 >= pwrite(tmpfd, strall.c_str(), strall.length(), 0)){
+        S3FS_PRN_ERR("failed to write stats to temporary file(%d)", errno);
+        close(tmpfd);
+        return false;
+    }
+    close(tmpfd);
+
+    // rename
+    if(0 != rename(strTmpFile.c_str(), sfile_path.c_str())){
+        S3FS_PRN_ERR("failed to rename temporary cache stat file path(%s) to %s cache", strTmpFile.c_str(), sfile_path.c_str());
+        unlink(strTmpFile.c_str());
+        return false;
+    }
+    return true;
+}
+
 bool CacheFileStat::RawOpen(bool readonly)
 {
     if(path.empty()){
@@ -202,39 +243,44 @@ bool CacheFileStat::RawOpen(bool readonly)
     }
     // stat path
     std::string sfile_path;
-    if(!CacheFileStat::MakeCacheFileStatPath(path.c_str(), sfile_path, true)){
+    if(0 != CacheFileStat::MakeCacheFileStatPath(path.c_str(), sfile_path, true)){
         S3FS_PRN_ERR("failed to create cache stat file path(%s)", path.c_str());
         return false;
     }
     // open
+    int tmpfd;
     if(readonly){
-        if(-1 == (fd = open(sfile_path.c_str(), O_RDONLY))){
+        if(-1 == (tmpfd = open(sfile_path.c_str(), O_RDONLY))){
             S3FS_PRN_ERR("failed to read only open cache stat file path(%s) - errno(%d)", path.c_str(), errno);
             return false;
         }
     }else{
-        if(-1 == (fd = open(sfile_path.c_str(), O_CREAT|O_RDWR, 0600))){
+        if(-1 == (tmpfd = open(sfile_path.c_str(), O_CREAT|O_RDWR, 0600))){
             S3FS_PRN_ERR("failed to open cache stat file path(%s) - errno(%d)", path.c_str(), errno);
             return false;
         }
     }
+    scope_guard guard([tmpfd, sfile_path]() {
+        if(-1 == close(tmpfd)){
+            S3FS_PRN_ERR("close() failed for %s - errno(%d)", sfile_path.c_str(), errno);
+        }
+    });
+
     // lock
-    if(-1 == flock(fd, LOCK_EX)){
+    if(-1 == flock(tmpfd, LOCK_EX)){
         S3FS_PRN_ERR("failed to lock cache stat file(%s) - errno(%d)", path.c_str(), errno);
-        close(fd);
-        fd = -1;
         return false;
     }
     // seek top
-    if(0 != lseek(fd, 0, SEEK_SET)){
+    if(0 != lseek(tmpfd, 0, SEEK_SET)){
         S3FS_PRN_ERR("failed to lseek cache stat file(%s) - errno(%d)", path.c_str(), errno);
-        flock(fd, LOCK_UN);
-        close(fd);
-        fd = -1;
+        flock(tmpfd, LOCK_UN);
         return false;
     }
     S3FS_PRN_DBG("file locked(%s - %s)", path.c_str(), sfile_path.c_str());
 
+    guard.dismiss();
+    fd = tmpfd;
     return true;
 }
 

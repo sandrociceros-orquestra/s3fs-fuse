@@ -18,15 +18,16 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#include <cstdio>
-#include <cstdlib>
+#include <ctime>
+#include <string>
+#include <sys/stat.h>
 #include <unistd.h>
-#include <sys/types.h>
 
-#include "common.h"
-#include "s3fs.h"
 #include "metaheader.h"
 #include "string_util.h"
+#include "filetimes.h"
+
+static constexpr struct timespec OMIT_TIMESPEC  = {0, UTIME_OMIT};
 
 //-------------------------------------------------------------------
 // Utility functions for convert
@@ -49,56 +50,86 @@ static struct timespec cvt_string_to_time(const char *str)
             strmtime.erase(pos);
         }
     }
-    return {static_cast<time_t>(cvt_strtoofft(strmtime.c_str(), /*base=*/ 10)), nsec};
+    struct timespec ts = {static_cast<time_t>(cvt_strtoofft(strmtime.c_str(), /*base=*/ 10)), nsec};
+    return ts;
 }
 
-static struct timespec get_time(const headers_t& meta, const char *header)
+// [NOTE]
+// Returns false if the header is not present at all. A present header is
+// parsed even when it holds a negative number of seconds, because times
+// before the epoch are legitimate(utimensat(2) accepts them). Absence is
+// reported separately rather than as a negative sentinel so that a real
+// pre-1970 timestamp is not mistaken for a missing header.
+//
+static bool get_time(const headers_t& meta, const char *header, struct timespec& ts)
 {
-    headers_t::const_iterator iter;
-    if(meta.end() == (iter = meta.find(header))){
-        return {-1, 0};
+    auto iter = meta.find(header);
+    if(meta.cend() == iter){
+        return false;
     }
-    return cvt_string_to_time((*iter).second.c_str());
+    ts = cvt_string_to_time(iter->second.c_str());
+    return true;
 }
 
 struct timespec get_mtime(const headers_t& meta, bool overcheck)
 {
-    struct timespec t = get_time(meta, "x-amz-meta-mtime");
-    if(0 < t.tv_sec){
-        return t;
+    struct timespec mtime;
+    if(get_time(meta, "x-amz-meta-mtime", mtime) && UTIME_OMIT != mtime.tv_nsec){
+        return mtime;
     }
-    t = get_time(meta, "x-amz-meta-goog-reserved-file-mtime");
-    if(0 < t.tv_sec){
-        return t;
+
+    if(get_time(meta, "x-amz-meta-goog-reserved-file-mtime", mtime) && UTIME_OMIT != mtime.tv_nsec){
+        return mtime;
     }
     if(overcheck){
-        return {get_lastmodified(meta), 0};
+        // [NOTE]
+        // get_lastmodified() reports a missing or unparsable Last-Modified
+        // header as -1, and a directory that exists only as the prefix of
+        // other keys has no header at all.  That is an absence rather than a
+        // time one second before the epoch, so it must not be handed back as
+        // a timestamp: report it as omitted and let the caller default it.
+        //
+        time_t lastmodified = get_lastmodified(meta);
+        if(-1 != lastmodified){
+            mtime = {lastmodified, 0};
+            return mtime;
+        }
     }
-    return {-1, 0};
+    return OMIT_TIMESPEC;
 }
 
 struct timespec get_ctime(const headers_t& meta, bool overcheck)
 {
-    struct timespec t = get_time(meta, "x-amz-meta-ctime");
-    if(0 < t.tv_sec){
-        return t;
+    struct timespec ctime;
+    if(get_time(meta, "x-amz-meta-ctime", ctime) && UTIME_OMIT != ctime.tv_nsec){
+        return ctime;
     }
     if(overcheck){
-        return {get_lastmodified(meta), 0};
+        // See the note in get_mtime() about a missing Last-Modified header.
+        time_t lastmodified = get_lastmodified(meta);
+        if(-1 != lastmodified){
+            ctime = {lastmodified, 0};
+            return ctime;
+        }
     }
-    return {-1, 0};
+    return OMIT_TIMESPEC;
 }
 
 struct timespec get_atime(const headers_t& meta, bool overcheck)
 {
-    struct timespec t = get_time(meta, "x-amz-meta-atime");
-    if(0 < t.tv_sec){
-        return t;
+    struct timespec atime;
+    if(get_time(meta, "x-amz-meta-atime", atime) && UTIME_OMIT != atime.tv_nsec){
+        return atime;
     }
     if(overcheck){
-        return {get_lastmodified(meta), 0};
+        // See the note in get_mtime() about a missing Last-Modified header.
+        time_t lastmodified = get_lastmodified(meta);
+        if(-1 != lastmodified){
+            atime = {lastmodified, 0};
+            return atime;
+        }
     }
-    return {-1, 0};
+    return OMIT_TIMESPEC;
 }
 
 off_t get_size(const char *s)
@@ -108,11 +139,11 @@ off_t get_size(const char *s)
 
 off_t get_size(const headers_t& meta)
 {
-    headers_t::const_iterator iter = meta.find("Content-Length");
-    if(meta.end() == iter){
+    auto iter = meta.find("Content-Length");
+    if(meta.cend() == iter){
         return 0;
     }
-    return get_size((*iter).second.c_str());
+    return get_size(iter->second.c_str());
 }
 
 mode_t get_mode(const char *s, int base)
@@ -120,23 +151,23 @@ mode_t get_mode(const char *s, int base)
     return static_cast<mode_t>(cvt_strtoofft(s, base));
 }
 
-mode_t get_mode(const headers_t& meta, const char* path, bool checkdir, bool forcedir)
+mode_t get_mode(const headers_t& meta, const std::string& strpath, bool checkdir, bool forcedir)
 {
     mode_t mode     = 0;
     bool   isS3sync = false;
     headers_t::const_iterator iter;
 
-    if(meta.end() != (iter = meta.find("x-amz-meta-mode"))){
-        mode = get_mode((*iter).second.c_str());
-    }else if(meta.end() != (iter = meta.find("x-amz-meta-permissions"))){ // for s3sync
-        mode = get_mode((*iter).second.c_str());
+    if(meta.cend() != (iter = meta.find("x-amz-meta-mode"))){
+        mode = get_mode(iter->second.c_str());
+    }else if(meta.cend() != (iter = meta.find("x-amz-meta-permissions"))){ // for s3sync
+        mode = get_mode(iter->second.c_str());
         isS3sync = true;
-    }else if(meta.end() != (iter = meta.find("x-amz-meta-goog-reserved-posix-mode"))){ // for GCS
-        mode = get_mode((*iter).second.c_str(), 8);
+    }else if(meta.cend() != (iter = meta.find("x-amz-meta-goog-reserved-posix-mode"))){ // for GCS
+        mode = get_mode(iter->second.c_str(), 8);
     }else{
         // If another tool creates an object without permissions, default to owner
         // read-write and group readable.
-        mode = path[strlen(path) - 1] == '/' ? 0750 : 0640;
+        mode = (!strpath.empty() && '/' == *strpath.rbegin()) ? 0750 : 0640;
     }
 
     // Checking the bitmask, if the last 3 bits are all zero then process as a regular
@@ -148,8 +179,8 @@ mode_t get_mode(const headers_t& meta, const char* path, bool checkdir, bool for
                 if(forcedir){
                     mode |= S_IFDIR;
                 }else{
-                    if(meta.end() != (iter = meta.find("Content-Type"))){
-                        std::string strConType = (*iter).second;
+                    if(meta.cend() != (iter = meta.find("Content-Type"))){
+                        std::string strConType = iter->second;
                         // Leave just the mime type, remove any optional parameters (eg charset)
                         std::string::size_type pos = strConType.find(';');
                         if(std::string::npos != pos){
@@ -158,24 +189,14 @@ mode_t get_mode(const headers_t& meta, const char* path, bool checkdir, bool for
                         if(strConType == "application/x-directory" || strConType == "httpd/unix-directory"){
                             // Nextcloud uses this MIME type for directory objects when mounting bucket as external Storage
                             mode |= S_IFDIR;
-                        }else if(path && 0 < strlen(path) && '/' == path[strlen(path) - 1]){
-                            if(strConType == "binary/octet-stream" || strConType == "application/octet-stream"){
-                                mode |= S_IFDIR;
-                            }else{
-                                if(complement_stat){
-                                    // If complement lack stat mode, when the object has '/' character at end of name
-                                    // and content type is text/plain and the object's size is 0 or 1, it should be
-                                    // directory.
-                                    off_t size = get_size(meta);
-                                    if(strConType == "text/plain" && (0 == size || 1 == size)){
-                                        mode |= S_IFDIR;
-                                    }else{
-                                        mode |= S_IFREG;
-                                    }
-                                }else{
-                                    mode |= S_IFREG;
-                                }
-                            }
+                        }else if(!strpath.empty() && '/' == *strpath.rbegin() && 0 == get_size(meta)){
+                            // A key ending with '/' cannot be a regular object in S3/GCS,
+                            // so treat it as a directory regardless of Content-Type. This
+                            // covers GCS placeholder objects (often text/plain) and other
+                            // providers that do not set a directory-specific Content-Type.
+                            // Require size 0 to guard against backends that return another
+                            // object's metadata for HEAD on a non-existent "path/" key.
+                            mode |= S_IFDIR;
                         }else{
                             mode |= S_IFREG;
                         }
@@ -186,7 +207,7 @@ mode_t get_mode(const headers_t& meta, const char* path, bool checkdir, bool for
             }
             // If complement lack stat mode, when it's mode is not set any permission,
             // the object is added minimal mode only for read permission.
-            if(complement_stat && 0 == (mode & (S_IRWXU | S_IRWXG | S_IRWXO))){
+            if(0 == (mode & (S_IRWXU | S_IRWXG | S_IRWXO))){
                 mode |= (S_IRUSR | (0 == (mode & S_IFDIR) ? 0 : S_IXUSR));
             }
         }else{
@@ -200,6 +221,104 @@ mode_t get_mode(const headers_t& meta, const char* path, bool checkdir, bool for
     return mode;
 }
 
+// [NOTE]
+// Gets a only FMT bit in mode from meta headers.
+// The processing is almost the same as get_mode().
+// This function is intended to be used from get_object_attribute().
+//
+static mode_t convert_meta_to_mode_fmt(const headers_t& meta)
+{
+    mode_t mode = 0;
+    bool   isS3sync = false;
+    headers_t::const_iterator iter;
+
+    if(meta.cend() != (iter = meta.find("x-amz-meta-mode"))){
+        mode = get_mode(iter->second.c_str());
+    }else if(meta.cend() != (iter = meta.find("x-amz-meta-permissions"))){ // for s3sync
+        mode = get_mode(iter->second.c_str());
+        isS3sync = true;
+    }else if(meta.cend() != (iter = meta.find("x-amz-meta-goog-reserved-posix-mode"))){ // for GCS
+        mode = get_mode(iter->second.c_str(), 8);
+    }
+
+    if(!(mode & S_IFMT)){
+        if(!isS3sync){
+            if(meta.cend() != (iter = meta.find("Content-Type"))){
+                std::string strConType = iter->second;
+                // Leave just the mime type, remove any optional parameters (eg charset)
+                std::string::size_type pos = strConType.find(';');
+                if(std::string::npos != pos){
+                    strConType.erase(pos);
+                }
+                if(strConType == "application/x-directory" || strConType == "httpd/unix-directory"){
+                    // Nextcloud uses this MIME type for directory objects when mounting bucket as external Storage
+                    mode |= S_IFDIR;
+                }
+            }
+        }
+    }
+    return (mode & S_IFMT);
+}
+
+bool is_reg_fmt(const headers_t& meta)
+{
+    return S_ISREG(convert_meta_to_mode_fmt(meta));
+}
+
+bool is_symlink_fmt(const headers_t& meta)
+{
+    return S_ISLNK(convert_meta_to_mode_fmt(meta));
+}
+
+bool is_dir_fmt(const headers_t& meta)
+{
+    return S_ISDIR(convert_meta_to_mode_fmt(meta));
+}
+
+// [NOTE]
+// For directory types, detailed judgment is not possible.
+// DIR_NORMAL is always returned.
+//
+// Objects uploaded using clients other than s3fs has a Content-Type
+// of application/unknown and dose not have x-amz-meta-mode header.
+// In this case, you can specify objtype_t as default_type.
+//
+objtype_t derive_object_type(const std::string& strpath, const headers_t& meta, objtype_t default_type)
+{
+    mode_t mode = convert_meta_to_mode_fmt(meta);
+
+    if(S_ISDIR(mode)){
+        if('/' != *strpath.rbegin()){
+            return objtype_t::DIR_NOT_TERMINATE_SLASH;
+        }else if(std::string::npos != strpath.find("_$folder$", 0)){
+            return objtype_t::DIR_FOLDER_SUFFIX;
+        }else{
+            // [NOTE]
+            // It returns DIR_NORMAL, although it could be DIR_NOT_EXIST_OBJECT.
+            //
+            return objtype_t::DIR_NORMAL;
+        }
+    }else if(S_ISLNK(mode)){
+        return objtype_t::SYMLINK;
+    }else if(S_ISREG(mode)){
+        return objtype_t::FILE;
+    }else if(0 == mode){
+        // If the x-amz-meta-mode header is not present, mode is 0.
+        if(auto iter = meta.find("Content-Type"); meta.cend() != iter){
+            std::string strConType = iter->second;
+            // Leave just the mime type, remove any optional parameters (eg charset)
+            std::string::size_type pos = strConType.find(';');
+            if(std::string::npos != pos){
+                strConType.erase(pos);
+            }
+            if(strConType == "application/unknown"){
+                return default_type;
+            }
+        }
+    }
+    return objtype_t::UNKNOWN;
+}
+
 uid_t get_uid(const char *s)
 {
     return static_cast<uid_t>(cvt_strtoofft(s, /*base=*/ 0));
@@ -208,12 +327,12 @@ uid_t get_uid(const char *s)
 uid_t get_uid(const headers_t& meta)
 {
     headers_t::const_iterator iter;
-    if(meta.end() != (iter = meta.find("x-amz-meta-uid"))){
-        return get_uid((*iter).second.c_str());
-    }else if(meta.end() != (iter = meta.find("x-amz-meta-owner"))){ // for s3sync
-        return get_uid((*iter).second.c_str());
-    }else if(meta.end() != (iter = meta.find("x-amz-meta-goog-reserved-posix-uid"))){ // for GCS
-        return get_uid((*iter).second.c_str());
+    if(meta.cend() != (iter = meta.find("x-amz-meta-uid"))){
+        return get_uid(iter->second.c_str());
+    }else if(meta.cend() != (iter = meta.find("x-amz-meta-owner"))){ // for s3sync
+        return get_uid(iter->second.c_str());
+    }else if(meta.cend() != (iter = meta.find("x-amz-meta-goog-reserved-posix-uid"))){ // for GCS
+        return get_uid(iter->second.c_str());
     }else{
         return geteuid();
     }
@@ -227,12 +346,12 @@ gid_t get_gid(const char *s)
 gid_t get_gid(const headers_t& meta)
 {
     headers_t::const_iterator iter;
-    if(meta.end() != (iter = meta.find("x-amz-meta-gid"))){
-        return get_gid((*iter).second.c_str());
-    }else if(meta.end() != (iter = meta.find("x-amz-meta-group"))){ // for s3sync
-        return get_gid((*iter).second.c_str());
-    }else if(meta.end() != (iter = meta.find("x-amz-meta-goog-reserved-posix-gid"))){ // for GCS
-        return get_gid((*iter).second.c_str());
+    if(meta.cend() != (iter = meta.find("x-amz-meta-gid"))){
+        return get_gid(iter->second.c_str());
+    }else if(meta.cend() != (iter = meta.find("x-amz-meta-group"))){ // for s3sync
+        return get_gid(iter->second.c_str());
+    }else if(meta.cend() != (iter = meta.find("x-amz-meta-goog-reserved-posix-gid"))){ // for GCS
+        return get_gid(iter->second.c_str());
     }else{
         return getegid();
     }
@@ -240,38 +359,42 @@ gid_t get_gid(const headers_t& meta)
 
 blkcnt_t get_blocks(off_t size)
 {
-    return size / 512 + 1;
+    return (size / 512) + (0 == (size % 512) ? 0 : 1);
 }
 
 time_t cvtIAMExpireStringToTime(const char* s)
 {
-    struct tm tm;
+    struct tm tm{};
     if(!s){
         return 0L;
     }
-    memset(&tm, 0, sizeof(struct tm));
-    strptime(s, "%Y-%m-%dT%H:%M:%S", &tm);
+    s3fs_strptime(s, "%Y-%m-%dT%H:%M:%S", &tm);
     return timegm(&tm); // GMT
 }
 
 time_t get_lastmodified(const char* s)
 {
-    struct tm tm;
+    struct tm tm{};
     if(!s){
         return -1;
     }
-    memset(&tm, 0, sizeof(struct tm));
-    strptime(s, "%a, %d %b %Y %H:%M:%S %Z", &tm);
+    // %Z was standardized for strptime in POSIX.1-2024; older systems may not support it.
+    // HTTP dates require GMT (RFC 9110 section 5.6.7), so matching it literally avoids %Z compatibility issues.
+    if(!s3fs_strptime(s, "%a, %d %b %Y %H:%M:%S GMT", &tm)){
+        // A partially parsed tm would otherwise be reported as a real time;
+        // callers treat -1 as an unparsable header.
+        return -1;
+    }
     return timegm(&tm); // GMT
 }
 
 time_t get_lastmodified(const headers_t& meta)
 {
-    headers_t::const_iterator iter = meta.find("Last-Modified");
-    if(meta.end() == iter){
+    auto iter = meta.find("Last-Modified");
+    if(meta.cend() == iter){
         return -1;
     }
-    return get_lastmodified((*iter).second.c_str());
+    return get_lastmodified(iter->second.c_str());
 }
 
 //
@@ -281,31 +404,30 @@ time_t get_lastmodified(const headers_t& meta)
 //
 bool is_need_check_obj_detail(const headers_t& meta)
 {
-    headers_t::const_iterator iter;
-
     // directory object is Content-Length as 0.
     if(0 != get_size(meta)){
         return false;
     }
     // if the object has x-amz-meta information, checking is no more.
-    if(meta.end() != meta.find("x-amz-meta-mode")  ||
-       meta.end() != meta.find("x-amz-meta-mtime") ||
-       meta.end() != meta.find("x-amz-meta-ctime") ||
-       meta.end() != meta.find("x-amz-meta-atime") ||
-       meta.end() != meta.find("x-amz-meta-uid")   ||
-       meta.end() != meta.find("x-amz-meta-gid")   ||
-       meta.end() != meta.find("x-amz-meta-owner") ||
-       meta.end() != meta.find("x-amz-meta-group") ||
-       meta.end() != meta.find("x-amz-meta-permissions") )
+    if(meta.cend() != meta.find("x-amz-meta-mode")  ||
+       meta.cend() != meta.find("x-amz-meta-mtime") ||
+       meta.cend() != meta.find("x-amz-meta-ctime") ||
+       meta.cend() != meta.find("x-amz-meta-atime") ||
+       meta.cend() != meta.find("x-amz-meta-uid")   ||
+       meta.cend() != meta.find("x-amz-meta-gid")   ||
+       meta.cend() != meta.find("x-amz-meta-owner") ||
+       meta.cend() != meta.find("x-amz-meta-group") ||
+       meta.cend() != meta.find("x-amz-meta-permissions") )
     {
         return false;
     }
     // if there is not Content-Type, or Content-Type is "x-directory",
     // checking is no more.
-    if(meta.end() == (iter = meta.find("Content-Type"))){
+    auto iter = meta.find("Content-Type");
+    if(meta.cend() == iter){
         return false;
     }
-    if("application/x-directory" == (*iter).second){
+    if("application/x-directory" == iter->second){
         return false;
     }
     return true;
@@ -317,13 +439,68 @@ bool is_need_check_obj_detail(const headers_t& meta)
 bool merge_headers(headers_t& base, const headers_t& additional, bool add_noexist)
 {
     bool added = false;
-    for(headers_t::const_iterator iter = additional.begin(); iter != additional.end(); ++iter){
-        if(add_noexist || base.find(iter->first) != base.end()){
-            base[iter->first] = iter->second;
-            added             = true;
+    for(const auto& [key, value] : additional){
+        if(add_noexist || base.find(key) != base.cend()){
+            base[key] = value;
+            added     = true;
         }
     }
     return added;
+}
+
+bool convert_header_to_stat(const std::string& strpath, const headers_t& meta, struct stat& stbuf, bool forcedir)
+{
+    stbuf = {};
+
+    // set hard link count always 1
+    stbuf.st_nlink = 1; // see fuse FAQ
+
+    // mode
+    stbuf.st_mode = get_mode(meta, strpath, true, forcedir);
+
+    // blocks
+    if(S_ISREG(stbuf.st_mode)){
+        stbuf.st_blocks = get_blocks(stbuf.st_size);
+    }
+    stbuf.st_blksize = 4096;
+
+    // [NOTE]
+    // Only an omitted(absent) time falls back to the epoch. A negative
+    // tv_sec is a valid time before 1970 and is passed through as-is.
+    //
+    // mtime
+    struct timespec mtime = get_mtime(meta);
+    if(UTIME_OMIT == mtime.tv_nsec){
+        mtime = {0, 0};
+    }
+    set_timespec_to_stat(stbuf, stat_time_type::MTIME, mtime);
+
+    // ctime
+    struct timespec ctime = get_ctime(meta);
+    if(UTIME_OMIT == ctime.tv_nsec){
+        ctime = {0, 0};
+    }
+    set_timespec_to_stat(stbuf, stat_time_type::CTIME, ctime);
+
+    // atime
+    struct timespec atime = get_atime(meta);
+    if(UTIME_OMIT == atime.tv_nsec){
+        atime = {0, 0};
+    }
+    set_timespec_to_stat(stbuf, stat_time_type::ATIME, atime);
+
+    // size
+    if(S_ISDIR(stbuf.st_mode)){
+        stbuf.st_size = 4096;
+    }else{
+        stbuf.st_size = get_size(meta);
+    }
+
+    // uid/gid
+    stbuf.st_uid = get_uid(meta);
+    stbuf.st_gid = get_gid(meta);
+
+    return true;
 }
 
 /*

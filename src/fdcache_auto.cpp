@@ -18,37 +18,15 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#include <cstdio>
-#include <cstdlib>
-
-#include "common.h"
-#include "s3fs.h"
+#include "s3fs_logger.h"
 #include "fdcache_auto.h"
 #include "fdcache.h"
 
 //------------------------------------------------
 // AutoFdEntity methods
 //------------------------------------------------
-AutoFdEntity::AutoFdEntity() : pFdEntity(NULL), pseudo_fd(-1)
+AutoFdEntity::AutoFdEntity() : pFdEntity(nullptr), pseudo_fd(-1)
 {
-}
-
-// [NOTE]
-// The copy constructor should not be called, then this is private method.
-// Even if it is called, the consistency of the number of
-// references can be maintained, but this case is not assumed.
-//
-AutoFdEntity::AutoFdEntity(AutoFdEntity& other) : pFdEntity(NULL), pseudo_fd(-1)
-{
-    S3FS_PRN_WARN("This method should not be called. Please check the caller.");
-
-    if(other.pFdEntity){
-        if(-1 != (pseudo_fd = other.pFdEntity->Dup(other.pseudo_fd))){
-            pFdEntity = other.pFdEntity;
-        }else{
-            S3FS_PRN_ERR("Failed duplicating fd in AutoFdEntity.");
-        }
-    }
 }
 
 AutoFdEntity::~AutoFdEntity()
@@ -63,7 +41,7 @@ bool AutoFdEntity::Close()
             S3FS_PRN_ERR("Failed to close fdentity.");
             return false;
         }
-        pFdEntity = NULL;
+        pFdEntity = nullptr;
         pseudo_fd = -1;
     }
     return true;
@@ -81,30 +59,54 @@ int AutoFdEntity::Detach()
     }
     int fd    = pseudo_fd;
     pseudo_fd = -1;
-    pFdEntity = NULL;
+    pFdEntity = nullptr;
 
     return fd;
 }
 
-bool AutoFdEntity::Attach(const char* path, int existfd)
+FdEntity* AutoFdEntity::Attach(const char* path, int existfd)
 {
     Close();
 
-    if(NULL == (pFdEntity = FdManager::get()->GetFdEntity(path, existfd, false))){
+    if(nullptr == (pFdEntity = FdManager::get()->GetFdEntity(path, existfd, false))){
         S3FS_PRN_DBG("Could not find fd entity object(file=%s, pseudo_fd=%d)", path, existfd);
-        return false;
+        return nullptr;
     }
     pseudo_fd = existfd;
-    return true;
+    return pFdEntity;
 }
 
-FdEntity* AutoFdEntity::Open(const char* path, headers_t* pmeta, off_t size, time_t time, int flags, bool force_tmpfile, bool is_create, AutoLock::Type type)
+// [NOTE]
+// Same as Attach, but finds the entity by pseudo fd alone.
+// This is used when the path is not available(null path from FUSE for
+// a file which was unlinked while open).
+//
+FdEntity* AutoFdEntity::AttachByPseudoFd(int existfd)
 {
     Close();
 
-    if(NULL == (pFdEntity = FdManager::get()->Open(pseudo_fd, path, pmeta, size, time, flags, force_tmpfile, is_create, type))){
+    if(nullptr == (pFdEntity = FdManager::get()->GetFdEntityByPseudoFd(existfd))){
+        S3FS_PRN_DBG("Could not find fd entity object(pseudo_fd=%d)", existfd);
+        return nullptr;
+    }
+    pseudo_fd = existfd;
+    return pFdEntity;
+}
+
+FdEntity* AutoFdEntity::Open(const char* path, const headers_t* pmeta, off_t size, const FileTimes& ts_times, int flags, bool force_tmpfile, bool is_create, bool ignore_modify, int* error)
+{
+    Close();
+
+    // FdManager::Open writes pseudo_fd via reference only on the path that
+    // reaches FdEntity::Open. Initialise to -EIO so early-return failure
+    // paths still yield a meaningful negative errno through *error.
+    pseudo_fd = -EIO;
+    if(nullptr == (pFdEntity = FdManager::get()->Open(pseudo_fd, path, pmeta, size, ts_times, flags, force_tmpfile, is_create, ignore_modify))){
+        if(error){
+            *error = pseudo_fd;
+        }
         pseudo_fd = -1;
-        return NULL;
+        return nullptr;
     }
     return pFdEntity;
 }
@@ -117,42 +119,32 @@ FdEntity* AutoFdEntity::GetExistFdEntity(const char* path, int existfd)
     Close();
 
     FdEntity* ent;
-    if(NULL == (ent = FdManager::get()->GetExistFdEntity(path, existfd))){
-        return NULL;
+    if(nullptr == (ent = FdManager::get()->GetExistFdEntity(path, existfd))){
+        return nullptr;
     }
     return ent;
+}
+
+// [NOTE]
+// Same as GetExistFdEntity, but finds the entity by pseudo fd alone.
+// This is used when the path is not available(null path from FUSE for
+// a file which was unlinked while open).
+//
+FdEntity* AutoFdEntity::GetExistFdEntityByPseudoFd(int existfd)
+{
+    Close();
+
+    return FdManager::get()->GetFdEntityByPseudoFd(existfd);
 }
 
 FdEntity* AutoFdEntity::OpenExistFdEntity(const char* path, int flags)
 {
     Close();
 
-    if(NULL == (pFdEntity = FdManager::get()->OpenExistFdEntity(path, pseudo_fd, flags))){
-        return NULL;
+    if(nullptr == (pFdEntity = FdManager::get()->OpenExistFdEntity(path, pseudo_fd, flags))){
+        return nullptr;
     }
     return pFdEntity;
-}
-
-// [NOTE]
-// This operator should not be called, then this is private method.
-// Even if it is called, the consistency of the number of
-// references can be maintained, but this case is not assumed.
-//
-bool AutoFdEntity::operator=(AutoFdEntity& other)
-{
-    S3FS_PRN_WARN("This method should not be called. Please check the caller.");
-
-    Close();
-
-    if(other.pFdEntity){
-        if(-1 != (pseudo_fd = other.pFdEntity->Dup(other.pseudo_fd))){
-            pFdEntity = other.pFdEntity;
-        }else{
-            S3FS_PRN_ERR("Failed duplicating fd in AutoFdEntity.");
-            return false;
-        }
-    }
-    return true;
 }
 
 /*

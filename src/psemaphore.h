@@ -24,6 +24,13 @@
 //-------------------------------------------------------------------
 // Class Semaphore
 //-------------------------------------------------------------------
+#if __cplusplus >= 202002L
+
+#include <semaphore>
+using Semaphore = std::counting_semaphore<INT_MAX>;
+
+#else
+
 // portability wrapper for sem_t since macOS does not implement it
 #ifdef __APPLE__
 
@@ -36,44 +43,72 @@ class Semaphore
         ~Semaphore()
         {
             // macOS cannot destroy a semaphore with posts less than the initializer
-            for(int i = 0; i < get_value(); ++i){
-                post();
+            for(int i = 0; i < value; ++i){
+                release();
             }
             dispatch_release(sem);
         }
-        void wait() { dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER); }
-        void post() { dispatch_semaphore_signal(sem); }
-        int get_value() const { return value; }
+        Semaphore(const Semaphore&) = delete;
+        Semaphore(Semaphore&&) = delete;
+        Semaphore& operator=(const Semaphore&) = delete;
+        Semaphore& operator=(Semaphore&&) = delete;
+
+        void acquire() { dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER); }
+        bool try_acquire()
+        {
+            if(0 == dispatch_semaphore_wait(sem, DISPATCH_TIME_NOW)){
+                return true;
+            }else{
+                return false;
+            }
+        }
+        void release() { dispatch_semaphore_signal(sem); }
 
     private:
-        const int value;
+        int value;
         dispatch_semaphore_t sem;
 };
 
 #else
 
-#include <errno.h>
+#include <cerrno>
 #include <semaphore.h>
 
 class Semaphore
 {
     public:
-        explicit Semaphore(int value) : value(value) { sem_init(&mutex, 0, value); }
+        explicit Semaphore(int value) { sem_init(&mutex, 0, value); }
         ~Semaphore() { sem_destroy(&mutex); }
-        void wait()
+        Semaphore(const Semaphore&) = delete;
+        Semaphore(Semaphore&&) = delete;
+        Semaphore& operator=(const Semaphore&) = delete;
+        Semaphore& operator=(Semaphore&&) = delete;
+
+        void acquire()
         {
             int r;
             do {
                 r = sem_wait(&mutex);
             } while (r == -1 && errno == EINTR);
         }
-        void post() { sem_post(&mutex); }
-        int get_value() const { return value; }
+
+        bool try_acquire()
+        {
+            int result;
+            do{
+                result = sem_trywait(&mutex);
+            }while(result == -1 && errno == EINTR);
+
+            return (0 == result);
+        }
+
+        void release() { sem_post(&mutex); }
 
     private:
-        const int value;
         sem_t mutex;
 };
+
+#endif
 
 #endif
 

@@ -21,21 +21,16 @@
 #ifndef S3FS_METAHEADER_H_
 #define S3FS_METAHEADER_H_
 
-#include <string>
 #include <map>
-#include <list>
+#include <string>
+#include <sys/stat.h>
+
+#include "types.h"
 
 //-------------------------------------------------------------------
 // headers_t
 //-------------------------------------------------------------------
-struct header_nocase_cmp : public std::binary_function<std::string, std::string, bool>
-{
-    bool operator()(const std::string &strleft, const std::string &strright) const
-    {
-        return (strcasecmp(strleft.c_str(), strright.c_str()) < 0);
-    }
-};
-typedef std::map<std::string, std::string, header_nocase_cmp> headers_t;
+using headers_t = std::map<std::string, std::string, case_insensitive_compare_func>;
 
 //-------------------------------------------------------------------
 // Functions
@@ -46,7 +41,11 @@ struct timespec get_atime(const headers_t& meta, bool overcheck = true);
 off_t get_size(const char *s);
 off_t get_size(const headers_t& meta);
 mode_t get_mode(const char *s, int base = 0);
-mode_t get_mode(const headers_t& meta, const char* path = NULL, bool checkdir = false, bool forcedir = false);
+mode_t get_mode(const headers_t& meta, const std::string& strpath, bool checkdir = false, bool forcedir = false);
+bool is_reg_fmt(const headers_t& meta);
+bool is_symlink_fmt(const headers_t& meta);
+bool is_dir_fmt(const headers_t& meta);
+objtype_t derive_object_type(const std::string& strpath, const headers_t& meta, objtype_t default_type = objtype_t::UNKNOWN);
 uid_t get_uid(const char *s);
 uid_t get_uid(const headers_t& meta);
 gid_t get_gid(const char *s);
@@ -57,7 +56,7 @@ time_t get_lastmodified(const char* s);
 time_t get_lastmodified(const headers_t& meta);
 bool is_need_check_obj_detail(const headers_t& meta);
 bool merge_headers(headers_t& base, const headers_t& additional, bool add_noexist);
-bool simple_parse_xml(const char* data, size_t len, const char* key, std::string& value);
+[[nodiscard]] bool convert_header_to_stat(const std::string& strpath, const headers_t& meta, struct stat& stbuf, bool forcedir = false);
 
 #endif // S3FS_METAHEADER_H_
 

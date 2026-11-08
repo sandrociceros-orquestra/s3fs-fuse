@@ -21,20 +21,31 @@
 #ifndef S3FS_S3OBJLIST_H_
 #define S3FS_S3OBJLIST_H_
 
+#include <map>
+#include <optional>
+#include <string>
+#include <sys/types.h>
+#include <utility>
+#include <vector>
+#include <sstream>
+
+#include "types.h"
+
 //-------------------------------------------------------------------
 // Structure / Typedef
 //-------------------------------------------------------------------
 struct s3obj_entry{
-    std::string normalname; // normalized name: if empty, object is normalized name.
-    std::string orgname;    // original name: if empty, object is original name.
+    std::string normalname;                 // normalized name: if empty, object is normalized name.
+    std::string orgname;                    // original name: if empty, object is original name.
     std::string etag;
-    bool        is_dir;
-
-    s3obj_entry() : is_dir(false) {}
+    off_t       size = -1;                  // Size from ListObjects <Contents>; -1 if unknown (e.g. CommonPrefix).
+    std::string last_modified;              // LastModified from ListObjects <Contents>, raw ISO 8601 string; empty if unknown.
+    objtype_t   type = objtype_t::UNKNOWN;  // only set for directories, UNKNOWN for non-directories.
 };
 
-typedef std::map<std::string, struct s3obj_entry> s3obj_t;
-typedef std::list<std::string> s3obj_list_t;
+using s3obj_t          = std::map<std::string, struct s3obj_entry>;
+using s3obj_list_t     = std::vector<std::string>;
+using s3obj_type_map_t = std::map<std::string, objtype_t>;
 
 //-------------------------------------------------------------------
 // Class S3ObjList
@@ -43,26 +54,32 @@ class S3ObjList
 {
     private:
         s3obj_t objects;
+        std::vector<std::string> common_prefixes;
 
-    private:
-        bool insert_normalized(const char* name, const char* normalized, bool is_dir);
+        bool insert_normalized(const char* name, const char* normalized, objtype_t type);
         const s3obj_entry* GetS3Obj(const char* name) const;
+        bool RawGetNames(s3obj_list_t* plist, s3obj_type_map_t* pobjmap, bool OnlyNormalized, bool CutSlash) const;
 
-        s3obj_t::const_iterator begin() const { return objects.begin(); }
-        s3obj_t::const_iterator end() const { return objects.end(); }
+        s3obj_t::const_iterator cbegin() const { return objects.cbegin(); }
+        s3obj_t::const_iterator cend() const { return objects.cend(); }
 
     public:
-        S3ObjList() {}
-        ~S3ObjList() {}
-
         bool IsEmpty() const { return objects.empty(); }
-        bool insert(const char* name, const char* etag = NULL, bool is_dir = false);
+        bool insert(const char* name, const char* etag = nullptr, bool is_dir = false, off_t size = -1, const char* last_modified = nullptr);
         std::string GetOrgName(const char* name) const;
         std::string GetNormalizedName(const char* name) const;
         std::string GetETag(const char* name) const;
+        off_t GetSize(const char* name) const;
+        std::string GetLastModified(const char* name) const;
+        const std::vector<std::string>& GetCommonPrefixes() const { return common_prefixes; }
+        void AddCommonPrefix(std::string prefix) { common_prefixes.push_back(std::move(prefix)); }
         bool IsDir(const char* name) const;
         bool GetNameList(s3obj_list_t& list, bool OnlyNormalized = true, bool CutSlash = true) const;
-        bool GetLastName(std::string& lastname) const;
+        bool GetNameMap(s3obj_type_map_t& objmap, bool OnlyNormalized = true, bool CutSlash = true) const;
+        std::optional<std::string> GetLastName() const;
+        bool HasName(const std::string& strName) const;
+        bool Remove(const std::string& strName);
+        void Dump(const std::string& indent, std::ostringstream& oss) const;
 
         static bool MakeHierarchizedList(s3obj_list_t& list, bool haveSlash);
 };

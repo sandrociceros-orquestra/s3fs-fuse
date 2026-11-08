@@ -18,60 +18,82 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
 #include <climits>
 #include <iomanip>
-
-#include <stdexcept>
+#include <locale>
 #include <sstream>
+#include <string>
+#include <utility>
+#include <regex>
+#include <fcntl.h>
+#include <sys/stat.h>  // NOLINT(misc-include-cleaner)
 
-#include "common.h"
-#include "s3fs.h"
+#include "s3fs_logger.h"
 #include "string_util.h"
 
-//-------------------------------------------------------------------
-// Global variables
-//-------------------------------------------------------------------
-const char SPACES[] = " \t\r\n";
-
-//-------------------------------------------------------------------
-// Templates
-//-------------------------------------------------------------------
-template <class T> std::string str(T value)
-{
-    std::ostringstream s;
-    s << value;
-    return s.str();
-}
-
-template std::string str(short value);
-template std::string str(unsigned short value);
-template std::string str(int value);
-template std::string str(unsigned int value);
-template std::string str(long value);
-template std::string str(unsigned long value);
-template std::string str(long long value);
-template std::string str(unsigned long long value);
-
-template<> std::string str(struct timespec value) {
-    std::ostringstream s;
-    s << value.tv_sec;
-    if(value.tv_nsec != 0){
-        s << "." << std::setfill('0') << std::setw(9) << value.tv_nsec;
-    }
-    return s.str();
-}
+using namespace std::string_view_literals;
 
 //-------------------------------------------------------------------
 // Functions
 //-------------------------------------------------------------------
+std::string str(const struct timespec& value)
+{
+    if(UTIME_OMIT == value.tv_nsec){
+        return "UTIME_OMIT";
+    }else if(UTIME_NOW == value.tv_nsec){
+        return "UTIME_NOW";
+    }else{
+        char buf[64];
+        size_t len;
+        if(value.tv_nsec == 0){
+            len = std::snprintf(buf, sizeof(buf), "%ld", value.tv_sec);
+        }else{
+            len = std::snprintf(buf, sizeof(buf), "%ld.%09ld", value.tv_sec, value.tv_nsec);
+        }
+        return std::string(buf, len);
+    }
+}
+
+// This source code is from https://gist.github.com/jeremyfromearth/5694aa3a66714254752179ecf3c95582 .
+const char* s3fs_strptime(const char* s, const char* f, struct tm* tm)
+{
+    std::istringstream input(s);
+    // Callers parse RFC 9110 and ISO 8601 dates, which use English names.
+    // The classic locale is therefore correct. Constructing a named locale from
+    // setlocale(LC_ALL, nullptr) throws on AIX and MinGW for composite names.
+    input.imbue(std::locale::classic());
+    input >> std::get_time(tm, f);
+    if(input.fail()){
+        return nullptr;
+    }
+    if(!input.eof()){
+        return s + input.tellg();
+    }
+
+    // The input ran out.  tellg() fails once eofbit is set, and libc++ does
+    // not set failbit when the input ends before the format does, so parse
+    // again with a sentinel appended to both to tell a complete match from a
+    // truncated one.
+    const std::string sentinel_input = std::string(s) + '\x01';
+    const std::string sentinel_format = std::string(f) + '\x01';
+    std::istringstream check(sentinel_input);
+    check.imbue(std::locale::classic());
+    check >> std::get_time(tm, sentinel_format.c_str());
+    if(check.fail()){
+        return nullptr;
+    }
+    return s + sentinel_input.size() - 1;
+}
 
 bool s3fs_strtoofft(off_t* value, const char* str, int base)
 {
-    if(value == NULL || str == NULL){
+    if(value == nullptr || str == nullptr){
         return false;
     }
     errno = 0;
@@ -101,22 +123,23 @@ off_t cvt_strtoofft(const char* str, int base)
 
 std::string lower(std::string s)
 {
-    // change each character of the std::string to lower case
-    for(size_t i = 0; i < s.length(); i++){
-        s[i] = tolower(s[i]);
-    }
+    std::transform(s.cbegin(), s.cend(), s.begin(), ::tolower);
     return s;
 }
 
-std::string trim_left(const std::string &s, const char *t /* = SPACES */)
+std::string upper(std::string s)
 {
-    std::string d(s);
-    return d.erase(0, s.find_first_not_of(t));
+    std::transform(s.cbegin(), s.cend(), s.begin(), ::toupper);
+    return s;
 }
 
-std::string trim_right(const std::string &s, const char *t /* = SPACES */)
+std::string trim_left(std::string d, const char *t /* = SPACES */)
 {
-    std::string d(s);
+    return d.erase(0, d.find_first_not_of(t));
+}
+
+std::string trim_right(std::string d, const char *t /* = SPACES */)
+{
     std::string::size_type i(d.find_last_not_of(t));
     if(i == std::string::npos){
         return "";
@@ -125,29 +148,47 @@ std::string trim_right(const std::string &s, const char *t /* = SPACES */)
     }
 }
 
-std::string trim(const std::string &s, const char *t /* = SPACES */)
+std::string trim(std::string s, const char *t /* = SPACES */)
 {
-    return trim_left(trim_right(s, t), t);
+    return trim_left(trim_right(std::move(s), t), t);
+}
+
+std::string peeloff(std::string s)
+{
+    if(s.size() < 2 || *s.cbegin() != '"' || *s.rbegin() != '"'){
+        return s;
+    }
+    s.erase(s.size() - 1);
+    s.erase(0, 1);
+    return s;
 }
 
 //
-// urlEncode a fuse path,
-// taking into special consideration "/",
-// otherwise regular urlEncode.
+// Three url encode functions
 //
-std::string urlEncode(const std::string &s)
+// urlEncodeGeneral: A general URL encoding function.
+// urlEncodePath   : A function that URL encodes by excluding the path
+//                   separator('/').
+// urlEncodeQuery  : A function that does URL encoding by excluding
+//                   some characters('=', '&' and '%').
+//                   This function can be used when the target string
+//                   contains already URL encoded strings. It also
+//                   excludes the character () used in query strings.
+//                   Therefore, it is a function to use as URL encoding
+//                   for use in query strings.
+//
+static constexpr char encode_general_except_chars[] = ".-_~";    // For general URL encode
+static constexpr char encode_path_except_chars[]    = ".-_~/";   // For fuse(included path) URL encode
+static constexpr char encode_query_except_chars[]   = ".-_~=&%"; // For query params(and encoded string)
+
+static std::string rawUrlEncode(std::string_view s, const char* except_chars)
 {
     std::string result;
-    for (size_t i = 0; i < s.length(); ++i) {
-        unsigned char c = s[i];
-        if (c == '/' // Note- special case for fuse paths...
-            || c == '.'
-            || c == '-'
-            || c == '_'
-            || c == '~'
-            || (c >= 'a' && c <= 'z')
-            || (c >= 'A' && c <= 'Z')
-            || (c >= '0' && c <= '9'))
+    for(unsigned char c : s){
+        if((except_chars && nullptr != strchr(except_chars, c)) ||
+           (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') )
         {
             result += c;
         }else{
@@ -158,37 +199,22 @@ std::string urlEncode(const std::string &s)
     return result;
 }
 
-//
-// urlEncode a fuse path,
-// taking into special consideration "/",
-// otherwise regular urlEncode.
-//
-std::string urlEncode2(const std::string &s)
+std::string urlEncodeGeneral(std::string_view s)
 {
-    std::string result;
-    for (size_t i = 0; i < s.length(); ++i) {
-        unsigned char c = s[i];
-        if (c == '=' // Note- special case for fuse paths...
-          || c == '&' // Note- special case for s3...
-          || c == '%'
-          || c == '.'
-          || c == '-'
-          || c == '_'
-          || c == '~'
-          || (c >= 'a' && c <= 'z')
-          || (c >= 'A' && c <= 'Z')
-          || (c >= '0' && c <= '9'))
-        {
-            result += c;
-        }else{
-            result += "%";
-            result += s3fs_hex_upper(&c, 1);
-        }
-    }
-    return result;
+    return rawUrlEncode(s, encode_general_except_chars);
 }
 
-std::string urlDecode(const std::string& s)
+std::string urlEncodePath(std::string_view s)
+{
+    return rawUrlEncode(s, encode_path_except_chars);
+}
+
+std::string urlEncodeQuery(std::string_view s)
+{
+    return rawUrlEncode(s, encode_query_except_chars);
+}
+
+std::string urlDecode(std::string_view s)
 {
     std::string result;
     for(size_t i = 0; i < s.length(); ++i){
@@ -234,27 +260,26 @@ bool takeout_str_dquart(std::string& str)
 //
 // ex. target="http://......?keyword=value&..."
 //
-bool get_keyword_value(const std::string& target, const char* keyword, std::string& value)
+std::optional<std::string> get_keyword_value(const std::string& target, const char* keyword)
 {
     if(!keyword){
-        return false;
+        return std::nullopt;
     }
     size_t spos;
     size_t epos;
     if(std::string::npos == (spos = target.find(keyword))){
-        return false;
+        return std::nullopt;
     }
     spos += strlen(keyword);
     if('=' != target[spos]){
-        return false;
+        return std::nullopt;
     }
     spos++;
     if(std::string::npos == (epos = target.find('&', spos))){
-        value = target.substr(spos);
+        return target.substr(spos);
     }else{
-        value = target.substr(spos, (epos - spos));
+        return target.substr(spos, (epos - spos));
     }
-    return true;
 }
 
 //
@@ -264,7 +289,7 @@ bool get_keyword_value(const std::string& target, const char* keyword, std::stri
 std::string get_date_rfc850()
 {
     char buf[100];
-    time_t t = time(NULL);
+    time_t t = time(nullptr);
     struct tm res;
     strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", gmtime_r(&t, &res));
     return buf;
@@ -272,7 +297,7 @@ std::string get_date_rfc850()
 
 void get_date_sigv3(std::string& date, std::string& date8601)
 {
-    time_t tm = time(NULL);
+    time_t tm = time(nullptr);
     date     = get_date_string(tm);
     date8601 = get_date_iso8601(tm);
 }
@@ -293,32 +318,31 @@ std::string get_date_iso8601(time_t tm)
     return buf;
 }
 
-bool get_unixtime_from_iso8601(const char* pdate, time_t& unixtime)
+std::optional<time_t> get_unixtime_from_iso8601(const char* pdate)
 {
     if(!pdate){
-        return false;
+        return std::nullopt;
     }
 
     struct tm tm;
-    char*     prest = strptime(pdate, "%Y-%m-%dT%T", &tm);
+    const char* prest = s3fs_strptime(pdate, "%Y-%m-%dT%T", &tm);
     if(prest == pdate){
         // wrong format
-        return false;
+        return std::nullopt;
     }
-    unixtime = mktime(&tm);
-    return true;
+    return timegm(&tm); // GMT
 }
 
 //
 // Convert to unixtime from std::string which formatted by following:
 //   "12Y12M12D12h12m12s", "86400s", "9h30m", etc
 //
-bool convert_unixtime_from_option_arg(const char* argv, time_t& unixtime)
+std::optional<time_t> convert_unixtime_from_option_arg(const char* argv)
 {
     if(!argv){
-      return false;
+      return std::nullopt;
     }
-    unixtime = 0;
+    time_t      unixtime = 0;
     const char* ptmp;
     int         last_unit_type = 0;       // unit flag.
     bool        is_last_number;
@@ -348,18 +372,18 @@ bool convert_unixtime_from_option_arg(const char* argv, time_t& unixtime)
                 unixtime      += tmptime;
                 last_unit_type = 6;
             }else{
-                return false;
+                return std::nullopt;
             }
             tmptime        = 0;
             is_last_number = false;
         }else{
-            return false;
+            return std::nullopt;
         }
     }
     if(is_last_number){
-        return false;
+        return std::nullopt;
     }
-    return true;
+    return unixtime;
 }
 
 static std::string s3fs_hex(const unsigned char* input, size_t length, const char *hexAlphabet)
@@ -382,84 +406,71 @@ std::string s3fs_hex_upper(const unsigned char* input, size_t length)
     return s3fs_hex(input, length, "0123456789ABCDEF");
 }
 
-char* s3fs_base64(const unsigned char* input, size_t length)
+std::string s3fs_base64(const unsigned char* input, size_t length)
 {
-    static const char base[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
-    char* result;
+    static constexpr char base[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
 
-    if(!input || 0 == length){
-        return NULL;
-    }
-    result = new char[((length + 3 - 1) / 3) * 4 + 1];
+    std::string result;
+    result.reserve(((length + 3 - 1) / 3) * 4 + 1);
 
     unsigned char parts[4];
     size_t rpos;
-    size_t wpos;
-    for(rpos = 0, wpos = 0; rpos < length; rpos += 3){
+    for(rpos = 0; rpos < length; rpos += 3){
         parts[0] = (input[rpos] & 0xfc) >> 2;
         parts[1] = ((input[rpos] & 0x03) << 4) | ((((rpos + 1) < length ? input[rpos + 1] : 0x00) & 0xf0) >> 4);
         parts[2] = (rpos + 1) < length ? (((input[rpos + 1] & 0x0f) << 2) | ((((rpos + 2) < length ? input[rpos + 2] : 0x00) & 0xc0) >> 6)) : 0x40;
         parts[3] = (rpos + 2) < length ? (input[rpos + 2] & 0x3f) : 0x40;
 
-        result[wpos++] = base[parts[0]];
-        result[wpos++] = base[parts[1]];
-        result[wpos++] = base[parts[2]];
-        result[wpos++] = base[parts[3]];
+        result += base[parts[0]];
+        result += base[parts[1]];
+        result += base[parts[2]];
+        result += base[parts[3]];
     }
-    result[wpos] = '\0';
 
     return result;
 }
 
-inline unsigned char char_decode64(const char ch)
+static constexpr unsigned char char_decode64(const char ch)
 {
-    unsigned char by;
     if('A' <= ch && ch <= 'Z'){                   // A - Z
-        by = static_cast<unsigned char>(ch - 'A');
+        return static_cast<unsigned char>(ch - 'A');
     }else if('a' <= ch && ch <= 'z'){             // a - z
-        by = static_cast<unsigned char>(ch - 'a' + 26);
+        return static_cast<unsigned char>(ch - 'a' + 26);
     }else if('0' <= ch && ch <= '9'){             // 0 - 9
-        by = static_cast<unsigned char>(ch - '0' + 52);
+        return static_cast<unsigned char>(ch - '0' + 52);
     }else if('+' == ch){                         // +
-        by = 62;
+        return 62;
     }else if('/' == ch){                         // /
-        by = 63;
+        return 63;
     }else if('=' == ch){                         // =
-        by = 64;
+        return 64;
     }else{                                       // something wrong
-        by = UCHAR_MAX;
+        return UCHAR_MAX;
     }
-    return by;
 }
 
-unsigned char* s3fs_decode64(const char* input, size_t input_len, size_t* plength)
+std::string s3fs_decode64(const char* input, size_t input_len)
 {
-    unsigned char* result;
-    if(!input || 0 == input_len || !plength){
-        return NULL;
-    }
-    result = new unsigned char[input_len / 4 * 3];
-
+    std::string result;
+    result.reserve(input_len / 4 * 3);
     unsigned char parts[4];
     size_t rpos;
-    size_t wpos;
-    for(rpos = 0, wpos = 0; rpos < input_len; rpos += 4){
+    for(rpos = 0; rpos < input_len; rpos += 4){
         parts[0] = char_decode64(input[rpos]);
         parts[1] = (rpos + 1) < input_len ? char_decode64(input[rpos + 1]) : 64;
         parts[2] = (rpos + 2) < input_len ? char_decode64(input[rpos + 2]) : 64;
         parts[3] = (rpos + 3) < input_len ? char_decode64(input[rpos + 3]) : 64;
 
-        result[wpos++] = ((parts[0] << 2) & 0xfc) | ((parts[1] >> 4) & 0x03);
+        result += static_cast<char>(((parts[0] << 2) & 0xfc) | ((parts[1] >> 4) & 0x03));
         if(64 == parts[2]){
             break;
         }
-        result[wpos++] = ((parts[1] << 4) & 0xf0) | ((parts[2] >> 2) & 0x0f);
+        result += static_cast<char>(((parts[1] << 4) & 0xf0) | ((parts[2] >> 2) & 0x0f));
         if(64 == parts[3]){
             break;
         }
-        result[wpos++] = ((parts[2] << 6) & 0xc0) | (parts[3] & 0x3f);
+        result += static_cast<char>(((parts[2] << 6) & 0xc0) | (parts[3] & 0x3f));
     }
-    *plength = wpos;
     return result;
 }
 
@@ -474,16 +485,16 @@ unsigned char* s3fs_decode64(const char* input, size_t input_len, size_t* plengt
 
 // Base location for transform.  The range 0xE000 - 0xF8ff
 // is a private range, se use the start of this range.
-static const unsigned int escape_base = 0xe000;
+static constexpr unsigned int escape_base = 0xe000;
 
-// encode bytes into wobbly utf8.  
+// encode bytes into wobbly utf8.
 // 'result' can be null. returns true if transform was needed.
 bool s3fs_wtf8_encode(const char *s, std::string *result)
 {
     bool invalid = false;
 
     // Pass valid utf8 code through
-    for (; *s; s++) {
+    for (; s && *s; s++) {
         const unsigned char c = *s;
 
         // single byte encoding
@@ -505,12 +516,12 @@ bool s3fs_wtf8_encode(const char *s, std::string *result)
                     *result += *(++s);
                 }
                 continue;
-            } 
+            }
             // three byte encoding
             if ((c & 0xf0) == 0xe0 && (s[1] & 0xc0) == 0x80 && (s[2] & 0xc0) == 0x80) {
                 const unsigned code = ((c & 0x0f) << 12) | ((s[1] & 0x3f) << 6) | (s[2] & 0x3f);
                 if (code >= 0x800 && ! (code >= 0xd800 && code <= 0xd8ff)) {
-                    // not overlong and not a surrogate pair 
+                    // not overlong and not a surrogate pair
                     if (result) {
                         *result += c;
                         *result += *(++s);
@@ -522,7 +533,7 @@ bool s3fs_wtf8_encode(const char *s, std::string *result)
             // four byte encoding
             if ((c & 0xf8) == 0xf0 && (s[1] & 0xc0) == 0x80 && (s[2] & 0xc0) == 0x80 && (s[3] & 0xc0) == 0x80) {
                 const unsigned code = ((c & 0x07) << 18) | ((s[1] & 0x3f) << 12) | ((s[2] & 0x3f) << 6) | (s[3] & 0x3f);
-                if (code >= 0x10000 && code <= 0x10ffff) {
+                if (code >= 0x10'000 && code <= 0x10f'fff) {
                   // not overlong and in defined unicode space
                   if (result) {
                       *result += c;
@@ -560,7 +571,7 @@ std::string s3fs_wtf8_encode(const std::string &s)
 bool s3fs_wtf8_decode(const char *s, std::string *result)
 {
     bool encoded = false;
-    for (; *s; s++) {
+    for (; s && *s; s++) {
         unsigned char c = *s;
         // look for a three byte tuple matching our encoding code
         if ((c & 0xf0) == 0xe0 && (s[1] & 0xc0) == 0x80 && (s[2] & 0xc0) == 0x80) {
@@ -583,12 +594,253 @@ bool s3fs_wtf8_decode(const char *s, std::string *result)
     }
     return encoded;
 }
- 
+
 std::string s3fs_wtf8_decode(const std::string &s)
 {
     std::string result;
     s3fs_wtf8_decode(s.c_str(), &result);
     return result;
+}
+
+//
+// Encode only CR('\r'=0x0D) and it also encodes the '%' character accordingly.
+//
+// The xmlReadMemory() function in libxml2 replaces CR code with LF code('\n'=0x0A)
+// due to the XML specification.
+// s3fs uses libxml2 to parse the S3 response, and this automatic substitution
+// of libxml2 may change the object name(file/dir name). Therefore, before passing
+// the response to the xmlReadMemory() function, we need the string encoded by
+// this function.
+//
+// [NOTE]
+// Normally the quotes included in the XML content data are HTML encoded("&quot;").
+// Encoding for CR can also be HTML encoded as binary code (ex, "&#13;"), but
+// if the same string content(as file name) as this encoded string exists, the
+// original string cannot be distinguished whichever encoded or not encoded.
+// Therefore, CR is encoded in the same manner as URL encoding("%0A").
+// And it is assumed that there is no CR code in the S3 response tag etc.(actually
+// it shouldn't exist)
+//
+std::string get_encoded_cr_code(const char* pbase)
+{
+    std::string result;
+    if(!pbase){
+        return result;
+    }
+    std::string strbase(pbase);
+    size_t      baselength = strbase.length();
+    size_t      startpos   = 0;
+    size_t      foundpos;
+    while(startpos < baselength && std::string::npos != (foundpos = strbase.find_first_of("%\r", startpos))){
+        if(0 < (foundpos - startpos)){
+            result += strbase.substr(startpos, foundpos - startpos);
+        }
+        if('%' == strbase[foundpos]){
+            result += "%45";
+        }else if('\r' == strbase[foundpos]){
+            result += "%0D";
+        }
+        startpos = foundpos + 1;
+    }
+    if(startpos < baselength){
+        result += strbase.substr(startpos);
+    }
+    return result;
+}
+
+//
+// Decode a string encoded with get_encoded_cr_code().
+//
+std::string get_decoded_cr_code(const char* pencode)
+{
+    std::string result;
+    if(!pencode){
+        return result;
+    }
+    std::string strencode(pencode);
+    size_t      encodelength = strencode.length();
+    size_t      startpos     = 0;
+    size_t      foundpos;
+    while(startpos < encodelength && std::string::npos != (foundpos = strencode.find('%', startpos))){
+        if(0 < (foundpos - startpos)){
+            result += strencode.substr(startpos, foundpos - startpos);
+        }
+        if((foundpos + 2) < encodelength && 0 == strencode.compare(foundpos, 3, "%45")){
+            result += '%';
+            startpos = foundpos + 3;
+        }else if((foundpos + 2) < encodelength && 0 == strencode.compare(foundpos, 3, "%0D")){
+            result += '\r';
+            startpos = foundpos + 3;
+        }else if((foundpos + 1) < encodelength && 0 == strencode.compare(foundpos, 2, "%%")){
+            result += '%';
+            startpos = foundpos + 2;
+        }else{
+            result += '%';
+            startpos = foundpos + 1;
+        }
+    }
+    if(startpos < encodelength){
+        result += strencode.substr(startpos);
+    }
+    return result;
+}
+
+//-------------------------------------------------------------------
+// Utilities for masking sensitive strings
+//-------------------------------------------------------------------
+const char* mask_sensitive_string_with_flag(const char* sensitive, bool nomask)
+{
+    if(!sensitive){
+        return "(null)";
+    }else if(nomask){
+        return sensitive;
+    }else{
+        return "[SENSITIVE]";
+    }
+}
+
+std::string mask_sensitive_header(const char* pheader, size_t length)
+{
+    static constexpr std::array SensitiveHeaders = {
+        "authorization:"sv,                                 // do not change this position(see. isAuthHeader)
+        "x-amz-security-token:"sv,
+        "x-amz-credential:"sv,
+        "x-amz-signature:"sv,
+        "x-amz-server-side-encryption-customer-key-md5:"sv,
+        "x-amz-server-side-encryption-aws-kms-key-id:"sv,
+        "x-amz-copy-source-server-side-encryption-customer-key:"sv,
+        "x-amz-copy-source-server-side-encryption-customer-key-md5:"sv
+    };
+
+    if(!pheader || length == 0){
+        return std::string();
+    }
+    std::string strHeader(pheader, length);
+
+    bool isAuthHeader = true;
+    for(const auto& one_sensitive: SensitiveHeaders){
+        if(CaseInsensitiveStringView(strHeader).is_prefix(one_sensitive)){
+            if(isAuthHeader){
+                // mask the element in Authorization header
+                static const std::regex aws4_check(R"(\s*AWS4-HMAC-SHA256\s+)", std::regex::icase);
+                static const std::regex aws2_check(R"(\s*AWS\s+)", std::regex::icase);
+
+                if(std::regex_search(strHeader, aws4_check)){
+                    // AWS Signature Version 4
+                    strHeader = std::regex_replace(strHeader, std::regex(R"((Credential)\s*=\s*[^,]+)",    std::regex::icase), "$1=[SENSITIVE]");
+                    strHeader = std::regex_replace(strHeader, std::regex(R"((SignedHeaders)\s*=\s*[^,]+)", std::regex::icase), "$1=[SENSITIVE]");
+                    strHeader = std::regex_replace(strHeader, std::regex(R"((Signature)\s*=\s*\S+)",       std::regex::icase), "$1=[SENSITIVE]");
+                }else if(std::regex_search(strHeader, aws2_check)){
+                    // AWS Signature Version 2
+                    strHeader = std::regex_replace(strHeader, std::regex(R"((\s*AWS\s+)(.+))", std::regex::icase), "$1[SENSITIVE]");
+                }else{
+                    // wrong format
+                    strHeader.resize(one_sensitive.size());
+                    strHeader += " [SENSITIVE(wrong format)]";
+                }
+            }else{
+                strHeader.resize(one_sensitive.size());
+                strHeader += " [SENSITIVE]";
+            }
+            break;
+        }
+        isAuthHeader = false;
+    }
+    return strHeader;
+}
+
+std::string mask_sensitive_arg(const char* arg)
+{
+    if(!arg || 0 == strlen(arg)){
+        return std::string();
+    }
+
+    std::string strArg(arg);
+    strArg = std::regex_replace(strArg, std::regex(R"((url=https?://)[^@]+(@))", std::regex::icase), "$1[SENSITIVE]$2");
+    strArg = std::regex_replace(strArg, std::regex(R"((ssl_client_cert=(?:[^:]+:){4})(.+))", std::regex::icase), "$1[SENSITIVE]");
+
+    return strArg;
+}
+
+static bool parse_xattr_keyval(const std::string& xattrpair, std::string& key, std::string* pval)
+{
+    // parse key and value
+    size_t pos;
+    std::string tmpval;
+    if(std::string::npos == (pos = xattrpair.find_last_of(':'))){
+        S3FS_PRN_ERR("one of xattr pair(%s) is wrong format.", xattrpair.c_str());
+        return false;
+    }
+    key    = xattrpair.substr(0, pos);
+    tmpval = xattrpair.substr(pos + 1);
+
+    if(!takeout_str_dquart(key) || !takeout_str_dquart(tmpval)){
+        S3FS_PRN_ERR("one of xattr pair(%s) is wrong format.", xattrpair.c_str());
+        return false;
+    }
+
+    *pval = s3fs_decode64(tmpval.c_str(), tmpval.size());
+
+    return true;
+}
+
+size_t parse_xattrs(const std::string& strxattrs, xattrs_t& xattrs)
+{
+    xattrs.clear();
+
+    // decode
+    std::string jsonxattrs = urlDecode(strxattrs);
+
+    // get from "{" to "}"
+    std::string restxattrs;
+    {
+        size_t startpos;
+        size_t endpos = std::string::npos;
+        if(std::string::npos != (startpos = jsonxattrs.find_first_of('{'))){
+            endpos = jsonxattrs.find_last_of('}');
+        }
+        if(startpos == std::string::npos || endpos == std::string::npos || endpos <= startpos){
+            S3FS_PRN_WARN("xattr header(%s) is not json format.", jsonxattrs.c_str());
+            return 0;
+        }
+        restxattrs = jsonxattrs.substr(startpos + 1, endpos - (startpos + 1));
+    }
+
+    // parse each key:val
+    for(size_t pair_nextpos = restxattrs.find_first_of(','); !restxattrs.empty(); restxattrs = (pair_nextpos != std::string::npos ? restxattrs.substr(pair_nextpos + 1) : ""), pair_nextpos = restxattrs.find_first_of(',')){
+        std::string pair = pair_nextpos != std::string::npos ? restxattrs.substr(0, pair_nextpos) : restxattrs;
+        std::string key;
+        std::string val;
+        if(!parse_xattr_keyval(pair, key, &val)){
+            // something format error, so skip this.
+            continue;
+        }
+        xattrs[key] = val;
+    }
+    return xattrs.size();
+}
+
+std::string raw_build_xattrs(const xattrs_t& xattrs)
+{
+    std::string strxattrs;
+    bool        is_set = false;
+    for(const auto& [key, value] : xattrs){
+        if(is_set){
+            strxattrs += ',';
+        }else{
+            is_set    = true;
+            strxattrs = "{";
+        }
+        strxattrs += '\"';
+        strxattrs += key;
+        strxattrs += "\":\"";
+        strxattrs += s3fs_base64(reinterpret_cast<const unsigned char*>(value.c_str()), value.length());
+        strxattrs += '\"';
+    }
+    if(is_set){
+        strxattrs += "}";
+    }
+    return strxattrs;
 }
 
 /*

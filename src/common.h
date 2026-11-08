@@ -21,33 +21,77 @@
 #ifndef S3FS_COMMON_H_
 #define S3FS_COMMON_H_
 
-#include <fcntl.h>
+#include <atomic>
+#include <string>
+#include <sys/types.h>
 
 #include "../config.h"
-#include "types.h"
-#include "s3fs_logger.h"
 
 //-------------------------------------------------------------------
 // Global variables
 //-------------------------------------------------------------------
 // TODO: namespace these
-static const int64_t  FIVE_GB            = 5LL * 1024LL * 1024LL * 1024LL;
-static const off_t    MIN_MULTIPART_SIZE = 5 * 1024 * 1024;
+inline constexpr int64_t  FIVE_GB            = 5LL * 1024LL * 1024LL * 1024LL;
+inline constexpr off_t    MIN_MULTIPART_SIZE = 5 * 1024 * 1024;
 
 extern bool           foreground;
 extern bool           nomultipart;
 extern bool           pathrequeststyle;
-extern bool           complement_stat;
 extern bool           noxmlns;
+extern bool           insecure_logging;
 extern std::string    program_name;
 extern std::string    service_path;
 extern std::string    s3host;
-extern std::string    bucket;
 extern std::string    mount_prefix;
-extern std::string    endpoint;
+extern std::string    region;
 extern std::string    cipher_suites;
 extern std::string    instance_name;
-extern std::string    aws_profile;
+
+extern std::atomic<long long unsigned> num_requests_head_object;
+extern std::atomic<long long unsigned> num_requests_put_object;
+extern std::atomic<long long unsigned> num_requests_get_object;
+extern std::atomic<long long unsigned> num_requests_delete_object;
+extern std::atomic<long long unsigned> num_requests_list_bucket;
+extern std::atomic<long long unsigned> num_requests_mpu_initiate;
+extern std::atomic<long long unsigned> num_requests_mpu_complete;
+extern std::atomic<long long unsigned> num_requests_mpu_abort;
+extern std::atomic<long long unsigned> num_requests_mpu_upload_part;
+extern std::atomic<long long unsigned> num_requests_mpu_copy_part;
+
+//-------------------------------------------------------------------
+// For weak attribute
+//-------------------------------------------------------------------
+#define S3FS_FUNCATTR_WEAK __attribute__ ((weak,unused))
+
+//-------------------------------------------------------------------
+// For clang -Wthread-safety
+//-------------------------------------------------------------------
+#ifdef __clang__
+#define THREAD_ANNOTATION_ATTRIBUTE(x)   __attribute__((x))
+#else
+#define THREAD_ANNOTATION_ATTRIBUTE(x)   // no-op
+#endif
+
+#define GUARDED_BY(x) \
+    THREAD_ANNOTATION_ATTRIBUTE(guarded_by(x))
+
+#define PT_GUARDED_BY(x) \
+    THREAD_ANNOTATION_ATTRIBUTE(pt_guarded_by(x))
+
+#define REQUIRES(...) \
+    THREAD_ANNOTATION_ATTRIBUTE(requires_capability(__VA_ARGS__))
+
+#define RETURN_CAPABILITY(...) \
+    THREAD_ANNOTATION_ATTRIBUTE(lock_returned(__VA_ARGS__))
+
+#define ACQUIRED_BEFORE(...) \
+    THREAD_ANNOTATION_ATTRIBUTE(acquired_before(__VA_ARGS__))
+
+#define ACQUIRED_AFTER(...) \
+    THREAD_ANNOTATION_ATTRIBUTE(acquired_after(__VA_ARGS__))
+
+#define NO_THREAD_SAFETY_ANALYSIS \
+    THREAD_ANNOTATION_ATTRIBUTE(no_thread_safety_analysis)
 
 #endif // S3FS_COMMON_H_
 

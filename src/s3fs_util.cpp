@@ -20,23 +20,27 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <unistd.h>
 #include <cerrno>
 #include <grp.h>
+#include <memory>
+#include <mutex>
 #include <pwd.h>
 #include <libgen.h>
 #include <dirent.h>
-#include <sys/types.h>
-#include <sys/utsname.h>
+#include <sys/stat.h>
 
 #include <string>
 #include <sstream>
 
-#include "common.h"
-#include "s3fs.h"
+#include "s3fs_logger.h"
 #include "s3fs_util.h"
 #include "string_util.h"
 #include "s3fs_help.h"
+#include "curl.h"
+
+using namespace std::string_literals;
 
 //-------------------------------------------------------------------
 // Global variables
@@ -65,20 +69,22 @@ void init_sysconf_vars()
     // there is no hard limit on the size of the buffer needed to
     // store all the groups returned.
 
+    errno = 0;
     long res = sysconf(_SC_GETPW_R_SIZE_MAX);
     if(0 > res){
         if (errno != 0){
-            S3FS_PRN_WARN("could not get max pw length.");
+            S3FS_PRN_ERR("could not get max password length.");
             abort();
         }
         res = 1024; // default initial length
     }
     max_password_size = res;
 
+    errno = 0;
     res = sysconf(_SC_GETGR_R_SIZE_MAX);
     if(0 > res) {
         if (errno != 0) {
-            S3FS_PRN_ERR("could not get max name length.");
+            S3FS_PRN_ERR("could not get max group name length.");
             abort();
         }
         res = 1024; // default initial length
@@ -94,32 +100,27 @@ std::string get_username(uid_t uid)
 {
     size_t maxlen = max_password_size;
     int result;
-    char* pbuf;
     struct passwd pwinfo;
-    struct passwd* ppwinfo = NULL;
+    struct passwd* ppwinfo = nullptr;
 
     // make buffer
-    pbuf = new char[maxlen];
+    auto pbuf = std::make_unique<char[]>(maxlen);
     // get pw information
-    while(ERANGE == (result = getpwuid_r(uid, &pwinfo, pbuf, maxlen, &ppwinfo))){
-        delete[] pbuf;
+    while(ERANGE == (result = getpwuid_r(uid, &pwinfo, pbuf.get(), maxlen, &ppwinfo))){
         maxlen *= 2;
-        pbuf = new char[maxlen];
+        pbuf = std::make_unique<char[]>(maxlen);
     }
 
     if(0 != result){
         S3FS_PRN_ERR("could not get pw information(%d).", result);
-        delete[] pbuf;
-        return std::string("");
+        return "";
     }
 
     // check pw
-    if(NULL == ppwinfo){
-        delete[] pbuf;
-        return std::string("");
+    if(nullptr == ppwinfo){
+        return "";
     }
     std::string name = SAFESTRPTR(ppwinfo->pw_name);
-    delete[] pbuf;
     return name;
 }
 
@@ -127,29 +128,25 @@ int is_uid_include_group(uid_t uid, gid_t gid)
 {
     size_t maxlen = max_group_name_length;
     int result;
-    char* pbuf;
     struct group ginfo;
-    struct group* pginfo = NULL;
+    struct group* pginfo = nullptr;
 
     // make buffer
-    pbuf = new char[maxlen];
+    auto pbuf = std::make_unique<char[]>(maxlen);
     // get group information
-    while(ERANGE == (result = getgrgid_r(gid, &ginfo, pbuf, maxlen, &pginfo))){
-        delete[] pbuf;
+    while(ERANGE == (result = getgrgid_r(gid, &ginfo, pbuf.get(), maxlen, &pginfo))){
         maxlen *= 2;
-        pbuf = new char[maxlen];
+        pbuf = std::make_unique<char[]>(maxlen);
     }
 
     if(0 != result){
         S3FS_PRN_ERR("could not get group information(%d).", result);
-        delete[] pbuf;
         return -result;
     }
 
     // check group
-    if(NULL == pginfo){
+    if(nullptr == pginfo){
         // there is not gid in group.
-        delete[] pbuf;
         return -EINVAL;
     }
 
@@ -159,45 +156,50 @@ int is_uid_include_group(uid_t uid, gid_t gid)
     for(ppgr_mem = pginfo->gr_mem; ppgr_mem && *ppgr_mem; ppgr_mem++){
         if(username == *ppgr_mem){
             // Found username in group.
-            delete[] pbuf;
             return 1;
         }
     }
-    delete[] pbuf;
     return 0;
 }
 
 //-------------------------------------------------------------------
 // Utility for file and directory
 //-------------------------------------------------------------------
-std::string mydirname(const std::string& path)
-{
-    return std::string(dirname((char*)path.c_str()));
-}
+// [NOTE]
+// basename/dirname returns a static variable pointer as the return value.
+// Normally this shouldn't be a problem, but in macos10 we found a case
+// where dirname didn't receive its return value correctly due to thread
+// conflicts.
+// To avoid this, exclusive control is performed by mutex.
+//
+static std::mutex basename_lock;
 
 // safe variant of dirname
 // dirname clobbers path so let it operate on a tmp copy
-std::string mydirname(const char* path)
+std::string mydirname(std::string path)
 {
-    if(!path || '\0' == path[0]){
-        return std::string("");
-    }
-    return mydirname(std::string(path));
-}
+    const std::lock_guard<std::mutex> lock(basename_lock);
 
-std::string mybasename(const std::string& path)
-{
-    return std::string(basename((char*)path.c_str()));
+    if(path.empty()){
+        return "";
+    }
+
+    path.push_back('\0');     // terminate with a null character and allocate space for it.
+    return dirname(path.data());
 }
 
 // safe variant of basename
 // basename clobbers path so let it operate on a tmp copy
-std::string mybasename(const char* path)
+std::string mybasename(std::string path)
 {
-    if(!path || '\0' == path[0]){
-        return std::string("");
+    const std::lock_guard<std::mutex> data_lock(basename_lock);
+
+    if(path.empty()){
+        return "";
     }
-    return mybasename(std::string(path));
+
+    path.push_back('\0');      // terminate with a null character and allocate space for it.
+    return basename(path.data());
 }
 
 // mkdir --parents
@@ -209,15 +211,15 @@ int mkdirp(const std::string& path, mode_t mode)
     while (getline(ss, component, '/')) {
         base += component + "/";
 
-        struct stat st;
-        if(0 == stat(base.c_str(), &st)){
-            if(!S_ISDIR(st.st_mode)){
-                return EPERM;
+        if(0 != mkdir(base.c_str(), mode)){
+            if(errno == EEXIST){
+                struct stat st;
+                if(0 != lstat(base.c_str(), &st) || !S_ISDIR(st.st_mode)){
+                    return -EPERM;
+                }
+            }else{
+                return -errno;
             }
-        }else{
-            if(0 != mkdir(base.c_str(), mode) && errno != EEXIST){
-                return errno;
-           }
         }
     }
     return 0;
@@ -226,7 +228,7 @@ int mkdirp(const std::string& path, mode_t mode)
 // get existed directory path
 std::string get_exist_directory_path(const std::string& path)
 {
-    std::string        existed("/");    // "/" is existed.
+    std::string        existed = "/"s;    // "/" is existed.
     std::string        base;
     std::string        component;
     std::istringstream ss(path);
@@ -294,13 +296,18 @@ bool check_exist_dir_permission(const char* dirpath)
 
 bool delete_files_in_dir(const char* dir, bool is_remove_own)
 {
-    DIR*           dp;
-    struct dirent* dent;
+    DIR*                 dp;
+    const struct dirent* dent;
 
-    if(NULL == (dp = opendir(dir))){
+    if(nullptr == (dp = opendir(dir))){
         S3FS_PRN_ERR("could not open dir(%s) - errno(%d)", dir, errno);
         return false;
     }
+    scope_guard dir_guard([dp, dir]() {
+        if(-1 == closedir(dp)){
+            S3FS_PRN_ERR("closedir() failed for %s - errno(%d)", dir, errno);
+        }
+    });
 
     for(dent = readdir(dp); dent; dent = readdir(dp)){
         if(0 == strcmp(dent->d_name, "..") || 0 == strcmp(dent->d_name, ".")){
@@ -312,58 +319,24 @@ bool delete_files_in_dir(const char* dir, bool is_remove_own)
         struct stat st;
         if(0 != lstat(fullpath.c_str(), &st)){
             S3FS_PRN_ERR("could not get stats of file(%s) - errno(%d)", fullpath.c_str(), errno);
-            closedir(dp);
             return false;
         }
         if(S_ISDIR(st.st_mode)){
             // dir -> Reentrant
             if(!delete_files_in_dir(fullpath.c_str(), true)){
                 S3FS_PRN_ERR("could not remove sub dir(%s) - errno(%d)", fullpath.c_str(), errno);
-                closedir(dp);
                 return false;
             }
         }else{
             if(0 != unlink(fullpath.c_str())){
                 S3FS_PRN_ERR("could not remove file(%s) - errno(%d)", fullpath.c_str(), errno);
-                closedir(dp);
                 return false;
             }
         }
     }
-    closedir(dp);
 
     if(is_remove_own && 0 != rmdir(dir)){
         S3FS_PRN_ERR("could not remove dir(%s) - errno(%d)", dir, errno);
-        return false;
-    }
-    return true;
-}
-
-//-------------------------------------------------------------------
-// Utility for system information
-//-------------------------------------------------------------------
-bool compare_sysname(const char* target)
-{
-    // [NOTE]
-    // The buffer size of sysname member in struct utsname is
-    // OS dependent, but 512 bytes is sufficient for now.
-    //
-    static char* psysname = NULL;
-    static char  sysname[512];
-    if(!psysname){
-        struct utsname sysinfo;
-        if(0 != uname(&sysinfo)){
-            S3FS_PRN_ERR("could not initialize system name to internal buffer(errno:%d), thus use \"Linux\".", errno);
-            strcpy(sysname, "Linux");
-        }else{
-            S3FS_PRN_INFO("system name is %s", sysinfo.sysname);
-            sysname[sizeof(sysname) - 1] = '\0';
-            strncpy(sysname, sysinfo.sysname, sizeof(sysname) - 1);
-        }
-        psysname = &sysname[0];
-    }
-
-    if(!target || 0 != strcmp(psysname, target)){
         return false;
     }
     return true;
@@ -384,12 +357,45 @@ void print_launch_message(int argc, char** argv)
                 if(0 == cnt){
                     message += basename(argv[cnt]);
                 }else{
-                    message += argv[cnt];
+                    if(!insecure_logging){
+                        message += mask_sensitive_arg(argv[cnt]);
+                    }else{
+                        message += argv[cnt];
+                    }
                 }
             }
         }
     }
     S3FS_PRN_LAUNCH_INFO("%s", message.c_str());
+
+    // Special message when insecure logging is enabled
+    if(insecure_logging){
+        S3FS_PRN_LAUNCH_INFO("%s", "[INSECURE] Deprecated option(insecure_logging) is specified. Authentication information such as tokens and credentials is output to the log.");
+    }
+
+    // Warn about disabled SSL verification (MITM vulnerability)
+    if(0 == S3fsCurl::GetSslVerifyHostname()){
+        S3FS_PRN_LAUNCH_INFO("%s", "SSL hostname verification is DISABLED (ssl_verify_hostname=0). Connections are vulnerable to MITM attacks.");
+    }
+    if(!S3fsCurl::IsCertCheck()){
+        S3FS_PRN_LAUNCH_INFO("%s", "SSL certificate verification is DISABLED (no_check_certificate). Connections are vulnerable to MITM attacks.");
+    }
+}
+
+int s3fs_fclose(FILE* fp)
+{
+    if(fp == nullptr){
+        return 0;
+    }
+    return fclose(fp);
+}
+
+//-------------------------------------------------------------------
+// Utilities for secure credential strings
+//-------------------------------------------------------------------
+const char* mask_sensitive_string(const char* sensitive)
+{
+    return mask_sensitive_string_with_flag(sensitive, insecure_logging);
 }
 
 /*

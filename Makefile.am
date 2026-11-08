@@ -17,37 +17,70 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 ######################################################################
+
 SUBDIRS=src test doc
 
-EXTRA_DIST=doc default_commit_hash
+EXTRA_DIST=default_commit_hash
 
-dist-hook:
-	rm -rf `find $(distdir)/doc -type d -name .svn`
-	rm -f `find $(distdir)/doc -type f -name Makefile`
+.PHONY: cppcheck shellcheck clang-tidy
 
-release : dist ../utils/release.sh
-	../utils/release.sh $(DIST_ARCHIVES)
+clang-tidy:
+	$(MAKE) -C src clang-tidy
+	$(MAKE) -C test clang-tidy
 
 cppcheck:
+	pjd_dir=$$(find test -maxdepth 1 -type d -name 'pjd-pjdfstest*' 2>/dev/null); \
 	cppcheck --quiet --error-exitcode=1 \
             --inline-suppr \
-            --std=c++03 \
+            --std=@CPP_VERSION@ \
             --xml \
             -D HAVE_ATTR_XATTR_H \
             -D HAVE_SYS_EXTATTR_H \
             -D HAVE_MALLOC_TRIM \
             -U CURLE_PEER_FAILED_VERIFICATION \
             -U ENOATTR \
+            $${pjd_dir:+-i "$$pjd_dir"} \
             --enable=warning,style,information,missingInclude \
             --suppress=missingIncludeSystem \
             --suppress=unmatchedSuppression \
+            --suppress=useStlAlgorithm \
+            --suppress=checkLevelNormal \
+            --suppress=normalCheckLevelMaxBranches \
+            --suppress=shadowFunction \
+            --suppress=shadowMember \
+            --addon=test/map-subscript-read.py \
             src/ test/
+
+#
+# ShellCheck
+#
+SHELLCHECK_CMD = shellcheck
+SHELLCHECK_SH_OPT = --shell=sh
+SHELLCHECK_BASH_OPT = --shell=bash
+
+# [NOTE]
+# To control error warnings as a whole, specify the "SC<number>" with the following variables.
+#
+SHELLCHECK_COMMON_IGN = --exclude=SC1091
+SHELLCHECK_CUSTOM_IGN = --exclude=SC1091
+
+shellcheck:
+	echo "* ShellCheck version"; \
+	$(SHELLCHECK_CMD) --version; \
+	echo ""; \
+	echo "* Check all sh files with ShellCheck"; \
+	LC_ALL=C.UTF-8 $(SHELLCHECK_CMD) $(SHELLCHECK_SH_OPT) $(SHELLCHECK_COMMON_IGN) $$(find . -type d -name 'pjd-pjdfstest*' -prune -o -type f -name '*.sh' -print | xargs grep -l '^#![[:space:]]*/bin/sh$$') || exit 1; \
+	echo "-> No error was detected."; \
+	echo ""; \
+	echo "* Check all bash files with ShellCheck"; \
+	LC_ALL=C.UTF-8 $(SHELLCHECK_CMD) $(SHELLCHECK_BASH_OPT) $(SHELLCHECK_COMMON_IGN) $$(find . -type d -name 'pjd-pjdfstest*' -prune -o -type f -name '*.sh' -print | xargs grep -l '^#![[:space:]]*/bin/bash$$') || exit 1; \
+	echo "-> No error was detected.";
 
 #
 # Local variables:
 # tab-width: 4
 # c-basic-offset: 4
 # End:
-# vim600: expandtab sw=4 ts= fdm=marker
+# vim600: expandtab sw=4 ts=4 fdm=marker
 # vim<600: expandtab sw=4 ts=4
 #

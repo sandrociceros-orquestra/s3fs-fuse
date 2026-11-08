@@ -1,7 +1,7 @@
 /*
  * s3fs - FUSE-based file system backed by Amazon S3
  *
- * Copyright(C) 2007 Randy Rizun <rrizun@gmail.com>
+ * Copyright(C) 2026 Andrew Gaul <andrew@gaul.org>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -18,30 +18,34 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#ifndef S3FS_MVNODE_H_
-#define S3FS_MVNODE_H_
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
 
-//-------------------------------------------------------------------
-// Structure
-//-------------------------------------------------------------------
-typedef struct mvnode
+// [NOTE]
+// This program calls truncate(2) with a path, unlike the truncate
+// command which opens the file and calls ftruncate(2). The filesystem
+// receives the request without a file handle, and no file descriptor
+// is open for the file.
+//
+int main(int argc, const char *argv[])
 {
-     char*          old_path;
-     char*          new_path;
-     bool           is_dir;
-     bool           is_normdir;
-     struct mvnode* prev;
-     struct mvnode* next;
-} MVNODE;
+    if(argc != 3){
+        fprintf(stderr, "[ERROR] Wrong parameters\n");
+        fprintf(stdout, "[Usage] path_truncate <file path> <truncate size(bytes)>\n");
+        exit(EXIT_FAILURE);
+    }
 
-//-------------------------------------------------------------------
-// Utility functions for moving objects
-//-------------------------------------------------------------------
-MVNODE *create_mvnode(const char *old_path, const char *new_path, bool is_dir, bool normdir = false);
-MVNODE *add_mvnode(MVNODE** head, MVNODE** tail, const char *old_path, const char *new_path, bool is_dir, bool normdir = false);
-void free_mvnodes(MVNODE *head);
+    const char* filepath = argv[1];
+    auto        size     = static_cast<off_t>(strtoull(argv[2], nullptr, 10));
 
-#endif // S3FS_MVNODE_H_
+    if(0 != truncate(filepath, size)){
+        fprintf(stderr, "[ERROR] Could not truncate file(%s) to %lld byte.\n", filepath, static_cast<long long>(size));
+        exit(EXIT_FAILURE);
+    }
+
+    exit(EXIT_SUCCESS);
+}
 
 /*
 * Local variables:

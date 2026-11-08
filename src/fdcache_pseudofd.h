@@ -21,12 +21,17 @@
 #ifndef S3FS_FDCACHE_PSEUDOFD_H_
 #define S3FS_FDCACHE_PSEUDOFD_H_
 
+#include <mutex>
+#include <vector>
+
+#include "common.h"
+
 //------------------------------------------------
 // Typdefs
 //------------------------------------------------
 // List of pseudo fd in use
 //
-typedef std::vector<int>    pseudofd_list_t;
+using pseudofd_list_t = std::vector<int>;
 
 //------------------------------------------------
 // Class PseudoFdManager
@@ -34,21 +39,24 @@ typedef std::vector<int>    pseudofd_list_t;
 class PseudoFdManager
 {
     private:
-        pseudofd_list_t pseudofd_list;
-        bool            is_lock_init;
-        pthread_mutex_t pseudofd_list_lock;    // protects pseudofd_list
+        pseudofd_list_t pseudofd_list GUARDED_BY(pseudofd_list_lock);
+        std::mutex      pseudofd_list_lock;    // protects pseudofd_list
 
-    private:
         static PseudoFdManager& GetManager();
 
-        PseudoFdManager();
-        ~PseudoFdManager();
+        PseudoFdManager() = default;
+        ~PseudoFdManager() = default;
 
-        int GetUnusedMinPseudoFd() const;
+        int GetUnusedMinPseudoFd() const REQUIRES(pseudofd_list_lock);
         int CreatePseudoFd();
         bool ReleasePseudoFd(int fd);
 
     public:
+        PseudoFdManager(const PseudoFdManager&) = delete;
+        PseudoFdManager(PseudoFdManager&&) = delete;
+        PseudoFdManager& operator=(const PseudoFdManager&) = delete;
+        PseudoFdManager& operator=(PseudoFdManager&&) = delete;
+
         static int Get();
         static bool Release(int fd);
 };

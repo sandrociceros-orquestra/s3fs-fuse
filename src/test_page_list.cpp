@@ -18,14 +18,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#include <limits>
-#include <stdint.h>
-#include <string>
-
-#include "fdcache.h"
+#include "fdcache_page.h"
+#include "fdcache_stat.h"
 #include "test_util.h"
 
-bool CacheFileStat::Open() { return false; }
+// cppcheck-suppress functionStatic
+bool CacheFileStat::Open() { return false; }                                            // NOLINT(readability-convert-member-functions-to-static)
+// cppcheck-suppress functionStatic
+bool CacheFileStat::OverWriteFile(const std::string& strall) const { return false; }    // NOLINT(readability-convert-member-functions-to-static)
 
 void test_compress()
 {
@@ -36,7 +36,7 @@ void test_compress()
   ASSERT_EQUALS(off_t(42), list.Size());
   ASSERT_FALSE(list.IsPageLoaded(0, 1));
 
-  list.SetPageLoadedStatus(0, 1, /*pstatus=*/ PageList::PAGE_LOADED);
+  list.SetPageLoadedStatus(0, 1, /*pstatus=*/ PageList::page_status::LOADED);
   ASSERT_TRUE(list.IsPageLoaded(0, 1));
   ASSERT_FALSE(list.IsPageLoaded(0, 2));
 
@@ -47,7 +47,7 @@ void test_compress()
   ASSERT_EQUALS(off_t(41), size);
 
   // test adding subsequent page then compressing
-  list.SetPageLoadedStatus(1, 3, /*pstatus=*/ PageList::PAGE_LOADED);
+  list.SetPageLoadedStatus(1, 3, /*pstatus=*/ PageList::page_status::LOADED);
   list.Compress();
   ASSERT_TRUE(list.IsPageLoaded(0, 3));
 
@@ -56,7 +56,7 @@ void test_compress()
   ASSERT_EQUALS(off_t(38), size);
 
   // test adding non-contiguous page then compressing
-  list.SetPageLoadedStatus(5, 1, /*pstatus=*/ PageList::PAGE_LOADED);
+  list.SetPageLoadedStatus(5, 1, /*pstatus=*/ PageList::page_status::LOADED);
   list.Compress();
 
   ASSERT_TRUE(list.FindUnloadedPage(0, start, size));
@@ -66,7 +66,7 @@ void test_compress()
   printf("\n");
 
   // test adding page between two pages then compressing
-  list.SetPageLoadedStatus(4, 1, /*pstatus=*/ PageList::PAGE_LOADED);
+  list.SetPageLoadedStatus(4, 1, /*pstatus=*/ PageList::page_status::LOADED);
   list.Compress();
 
   list.Dump();
@@ -75,7 +75,7 @@ void test_compress()
   ASSERT_EQUALS(off_t(36), size);
 }
 
-int main(int argc, char *argv[])
+int main(int argc, const char *argv[])
 {
   test_compress();
   return 0;

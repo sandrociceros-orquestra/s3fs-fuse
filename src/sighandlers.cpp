@@ -18,40 +18,24 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#include <cstdio>
-#include <cstdlib>
-#include <csignal>
-#include <pthread.h>
+#include <memory>
+#include <signal.h>  // NOLINT(modernize-deprecated-headers)
+#include <thread>
+#include <utility>
 
-#include "common.h"
-#include "s3fs.h"
+#include "psemaphore.h"
+#include "s3fs_logger.h"
 #include "sighandlers.h"
 #include "fdcache.h"
 
 //-------------------------------------------------------------------
 // Class S3fsSignals
 //-------------------------------------------------------------------
-S3fsSignals* S3fsSignals::pSingleton = NULL;
-bool S3fsSignals::enableUsr1         = false;
+bool S3fsSignals::enableUsr1 = false;
 
 //-------------------------------------------------------------------
 // Class methods
 //-------------------------------------------------------------------
-bool S3fsSignals::Initialize()
-{
-    if(!S3fsSignals::pSingleton){
-        S3fsSignals::pSingleton = new S3fsSignals;
-    }
-    return true;
-}
-
-bool S3fsSignals::Destroy()
-{
-    delete S3fsSignals::pSingleton;
-    S3fsSignals::pSingleton = NULL;
-    return true;
-}
-
 void S3fsSignals::HandlerUSR1(int sig)
 {
     if(SIGUSR1 != sig){
@@ -59,13 +43,7 @@ void S3fsSignals::HandlerUSR1(int sig)
         return;
     }
 
-    S3fsSignals* pSigobj = S3fsSignals::get();
-    if(!pSigobj){
-        S3FS_PRN_ERR("S3fsSignals object is not initialized.");
-        return;
-    }
-
-    if(!pSigobj->WakeupUsr1Thread()){
+    if(!S3fsSignals::get()->WakeupUsr1Thread()){
         S3FS_PRN_ERR("Failed to wakeup the thread for SIGUSR1.");
         return;
     }
@@ -89,22 +67,24 @@ bool S3fsSignals::SetUsr1Handler(const char* path)
     return true;
 }
 
-void* S3fsSignals::CheckCacheWorker(void* arg)
+void S3fsSignals::CheckCacheWorker(Semaphore* pSem)
 {
-    Semaphore* pSem   = static_cast<Semaphore*>(arg);
     if(!pSem){
-        pthread_exit(NULL);
+        return;
     }
     if(!S3fsSignals::enableUsr1){
-        pthread_exit(NULL);
+        return;
     }
 
     // wait and loop
     while(S3fsSignals::enableUsr1){
         // wait
-        pSem->wait();
+        pSem->acquire();
+
+        // cppcheck-suppress unmatchedSuppression
+        // cppcheck-suppress knownConditionTrueFalse
         if(!S3fsSignals::enableUsr1){
-            break;    // assap
+            break;  // asap
         }
 
         // check all cache
@@ -113,11 +93,8 @@ void* S3fsSignals::CheckCacheWorker(void* arg)
         }
 
         // do not allow request queuing
-        for(int value = pSem->get_value(); 0 < value; value = pSem->get_value()){
-            pSem->wait();
-        }
+        while(pSem->try_acquire());
     }
-    return NULL;
 }
 
 void S3fsSignals::HandlerUSR2(int sig)
@@ -131,12 +108,10 @@ void S3fsSignals::HandlerUSR2(int sig)
 
 bool S3fsSignals::InitUsr2Handler()
 {
-    struct sigaction sa;
-
-    memset(&sa, 0, sizeof(struct sigaction));
+    struct sigaction sa{};
     sa.sa_handler = S3fsSignals::HandlerUSR2;
     sa.sa_flags   = SA_RESTART;
-    if(0 != sigaction(SIGUSR2, &sa, NULL)){
+    if(0 != sigaction(SIGUSR2, &sa, nullptr)){
         return false;
     }
     return true;
@@ -153,12 +128,10 @@ void S3fsSignals::HandlerHUP(int sig)
 
 bool S3fsSignals::InitHupHandler()
 {
-    struct sigaction sa;
-
-    memset(&sa, 0, sizeof(struct sigaction));
+    struct sigaction sa{};
     sa.sa_handler = S3fsSignals::HandlerHUP;
     sa.sa_flags   = SA_RESTART;
-    if(0 != sigaction(SIGHUP, &sa, NULL)){
+    if(0 != sigaction(SIGHUP, &sa, nullptr)){
         return false;
     }
     return true;
@@ -167,7 +140,7 @@ bool S3fsSignals::InitHupHandler()
 //-------------------------------------------------------------------
 // Methods
 //-------------------------------------------------------------------
-S3fsSignals::S3fsSignals() : pThreadUsr1(NULL), pSemUsr1(NULL)
+S3fsSignals::S3fsSignals()
 {
     if(S3fsSignals::enableUsr1){
         if(!InitUsr1Handler()){
@@ -199,24 +172,15 @@ bool S3fsSignals::InitUsr1Handler()
     }
 
     // create thread
-    int result;
-    pSemUsr1    = new Semaphore(0);
-    pThreadUsr1 = new pthread_t;
-    if(0 != (result = pthread_create(pThreadUsr1, NULL, S3fsSignals::CheckCacheWorker, static_cast<void*>(pSemUsr1)))){
-        S3FS_PRN_ERR("Could not create thread for SIGUSR1 by %d", result);
-        delete pSemUsr1;
-        delete pThreadUsr1;
-        pSemUsr1    = NULL;
-        pThreadUsr1 = NULL;
-        return false;
-    }
+    auto pSemUsr1_tmp = std::make_unique<Semaphore>(0);
+    pThreadUsr1 = std::make_unique<std::thread>(S3fsSignals::CheckCacheWorker, pSemUsr1_tmp.get());
+    pSemUsr1 = std::move(pSemUsr1_tmp);
 
     // set handler
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(struct sigaction));
+    struct sigaction sa{};
     sa.sa_handler = S3fsSignals::HandlerUSR1;
     sa.sa_flags   = SA_RESTART;
-    if(0 != sigaction(SIGUSR1, &sa, NULL)){
+    if(0 != sigaction(SIGUSR1, &sa, nullptr)){
         S3FS_PRN_ERR("Could not set signal handler for SIGUSR1");
         DestroyUsr1Handler();
         return false;
@@ -234,19 +198,12 @@ bool S3fsSignals::DestroyUsr1Handler()
     S3fsSignals::enableUsr1 = false;
 
     // wakeup thread
-    pSemUsr1->post();
+    pSemUsr1->release();
 
     // wait for thread exiting
-    void* retval = NULL;
-    int   result;
-    if(0 != (result = pthread_join(*pThreadUsr1, &retval))){
-        S3FS_PRN_ERR("Could not stop thread for SIGUSR1 by %d", result);
-        return false;
-    }
-    delete pSemUsr1;
-    delete pThreadUsr1;
-    pSemUsr1    = NULL;
-    pThreadUsr1 = NULL;
+    pThreadUsr1->join();
+    pSemUsr1.reset();
+    pThreadUsr1.reset();
 
     return true;
 }
@@ -257,7 +214,7 @@ bool S3fsSignals::WakeupUsr1Thread()
         S3FS_PRN_ERR("The thread for SIGUSR1 is not setup.");
         return false;
     }
-    pSemUsr1->post();
+    pSemUsr1->release();
     return true;
 }
 

@@ -24,45 +24,71 @@
 set -o errexit
 set -o pipefail
 
+#
 # Configuration
+#
 TEST_TEXT="HELLO WORLD"
 TEST_TEXT_FILE=test-s3fs.txt
 TEST_DIR=testdir
+# shellcheck disable=SC2034
 ALT_TEST_TEXT_FILE=test-s3fs-ALT.txt
+# shellcheck disable=SC2034
 TEST_TEXT_FILE_LENGTH=15
+# shellcheck disable=SC2034
 BIG_FILE=big-file-s3fs.txt
-TEMP_DIR=${TMPDIR:-"/var/tmp"}
+# shellcheck disable=SC2034
+TEMP_DIR="${TMPDIR:-"/var/tmp"}"
+
 # /dev/urandom can only return 32 MB per block maximum
 BIG_FILE_BLOCK_SIZE=$((25 * 1024 * 1024))
 BIG_FILE_COUNT=1
+
 # This should be greater than the multipart size
-BIG_FILE_LENGTH=$(($BIG_FILE_BLOCK_SIZE * $BIG_FILE_COUNT))
+# shellcheck disable=SC2034
+BIG_FILE_LENGTH=$((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT))
+
 # Set locale because some tests check for English expressions
 export LC_ALL=en_US.UTF-8
-export RUN_DIR
 
 # [NOTE]
-# stdbuf, truncate and sed installed on macos do not work as
+# truncate installed on macos does not work as
 # expected(not compatible with Linux).
 # Therefore, macos installs a brew package such as coreutils
-# and uses gnu commands(gstdbuf, gtruncate, gsed).
+# and uses gnu commands(gtruncate).
 # Set your PATH appropriately so that you can find these commands.
 #
-if [ `uname` = "Darwin" ]; then
-    export STDBUF_BIN="gstdbuf"
+if [ "$(uname)" = "Darwin" ]; then
+    export STAT_BIN="gstat"
     export TRUNCATE_BIN="gtruncate"
-    export SED_BIN="gsed"
-    export BASE64_BIN="gbase64"
+    export SHA256SUM_BIN="gsha256sum"
 else
-    export STDBUF_BIN="stdbuf"
+    export STAT_BIN="stat"
     export TRUNCATE_BIN="truncate"
-    export SED_BIN="sed"
-    export BASE64_BIN="base64"
+    export SHA256SUM_BIN="sha256sum"
 fi
-export SED_BUFFER_FLAG="--unbuffered"
+
+# [NOTE]
+# Specifying cache disable option depending on stat(coreutils) version
+# TODO: investigate why this is necessary #2327
+#
+if "${STAT_BIN[@]}" --cached=never / >/dev/null 2>&1; then
+    STAT_BIN=("${STAT_BIN[@]}" --cache=never)
+fi
+
+function find_xattr() {
+    if [ "$(uname)" = "Darwin" ]; then
+        local LIST_XATTRS_KEYVALS; LIST_XATTRS_KEYVALS=$(xattr -l "$2" 2>/dev/null)
+        if ! echo "${LIST_XATTRS_KEYVALS}" | grep -q "$1"; then
+            return 1
+        fi
+    else
+        getfattr --absolute-names -n "$1" "$2" >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
 
 function get_xattr() {
-    if [ `uname` = "Darwin" ]; then
+    if [ "$(uname)" = "Darwin" ]; then
         xattr -p "$1" "$2"
     else
         getfattr -n "$1" --only-values "$2"
@@ -70,7 +96,7 @@ function get_xattr() {
 }
 
 function set_xattr() {
-    if [ `uname` = "Darwin" ]; then
+    if [ "$(uname)" = "Darwin" ]; then
         xattr -w "$1" "$2" "$3"
     else
         setfattr -n "$1" -v "$2" "$3"
@@ -78,80 +104,67 @@ function set_xattr() {
 }
 
 function del_xattr() {
-    if [ `uname` = "Darwin" ]; then
+    if [ "$(uname)" = "Darwin" ]; then
         xattr -d "$1" "$2"
     else
         setfattr -x "$1" "$2"
     fi
 }
 
+function get_inode() {
+    "${STAT_BIN[@]}" --format "%i" "$1"
+}
+
 function get_size() {
-    if [ `uname` = "Darwin" ]; then
-        stat -f "%z" "$1"
-    else
-        stat -c %s "$1"
-    fi
+    "${STAT_BIN[@]}" --format "%s" "$1"
 }
 
 function check_file_size() {
-    FILE_NAME="$1"
-    EXPECTED_SIZE="$2"
+    local FILE_NAME="$1"
+    local EXPECTED_SIZE="$2"
 
-    # Verify file is zero length via metadata
-    size=$(get_size ${FILE_NAME})
-    if [ $size -ne $EXPECTED_SIZE ]
+    # Verify file length via metadata
+    local size
+    size=$(get_size "${FILE_NAME}")
+    if [ "${size}" -ne "${EXPECTED_SIZE}" ]
     then
-        echo "error: expected ${FILE_NAME} to be zero length"
+        echo "error: expected ${FILE_NAME} to be ${EXPECTED_SIZE} length but was ${size} via metadata"
         return 1
     fi
 
-    # Verify file is zero length via data
-    size=$(cat ${FILE_NAME} | wc -c)
-    if [ $size -ne $EXPECTED_SIZE ]
+    # Verify file length via data
+    # shellcheck disable=SC2002
+    size=$(cat "${FILE_NAME}" | wc -c)
+    if [ "${size}" -ne "${EXPECTED_SIZE}" ]
     then
-        echo "error: expected ${FILE_NAME} to be $EXPECTED_SIZE length, got $size"
+        echo "error: expected ${FILE_NAME} to be ${EXPECTED_SIZE} length, got ${size} via data"
         return 1
     fi
 }
 
 function mk_test_file {
-    if [ $# == 0 ]; then
-        TEXT=$TEST_TEXT
+    if [ $# = 0 ]; then
+        local TEXT="${TEST_TEXT}"
     else
-        TEXT=$1
+        local TEXT="$1"
     fi
-    echo $TEXT > $TEST_TEXT_FILE
-    if [ ! -e $TEST_TEXT_FILE ]
+    echo "${TEXT}" > "${TEST_TEXT_FILE}"
+    if [ ! -e "${TEST_TEXT_FILE}" ]
     then
         echo "Could not create file ${TEST_TEXT_FILE}, it does not exist"
         exit 1
     fi
-
-    # wait & check
-    BASE_TEXT_LENGTH=`echo $TEXT | wc -c | awk '{print $1}'`
-    TRY_COUNT=10
-    while true; do
-        MK_TEXT_LENGTH=`wc -c $TEST_TEXT_FILE | awk '{print $1}'`
-        if [ $BASE_TEXT_LENGTH -eq $MK_TEXT_LENGTH ]; then
-            break
-        fi
-        TRY_COUNT=`expr $TRY_COUNT - 1`
-        if [ $TRY_COUNT -le 0 ]; then
-            echo "Could not create file ${TEST_TEXT_FILE}, that file size is something wrong"
-        fi
-        sleep 1
-    done
 }
 
 function rm_test_file {
-    if [ $# == 0 ]; then
-        FILE=$TEST_TEXT_FILE
+    if [ $# = 0 ]; then
+        local FILE="${TEST_TEXT_FILE}"
     else
-        FILE=$1
+        local FILE="$1"
     fi
-    rm -f $FILE
+    rm -f "${FILE}"
 
-    if [ -e $FILE ]
+    if [ -e "${FILE}" ]
     then
         echo "Could not cleanup file ${TEST_TEXT_FILE}"
         exit 1
@@ -159,37 +172,42 @@ function rm_test_file {
 }
 
 function mk_test_dir {
-    mkdir ${TEST_DIR}
+    mkdir "${TEST_DIR}"
 
-    if [ ! -d ${TEST_DIR} ]; then
+    if [ ! -d "${TEST_DIR}" ]; then
         echo "Directory ${TEST_DIR} was not created"
         exit 1
     fi
 }
 
 function rm_test_dir {
-    rmdir ${TEST_DIR}
-    if [ -e $TEST_DIR ]; then
+    rmdir "${TEST_DIR}"
+    if [ -e "${TEST_DIR}" ]; then
         echo "Could not remove the test directory, it still exists: ${TEST_DIR}"
         exit 1
     fi
 }
 
 # Create and cd to a unique directory for this test run
-# Sets RUN_DIR to the name of the created directory
 function cd_run_dir {
-    if [ "$TEST_BUCKET_MOUNT_POINT_1" == "" ]; then
+    if [ "${TEST_BUCKET_MOUNT_POINT_1}" = "" ]; then
         echo "TEST_BUCKET_MOUNT_POINT_1 variable not set"
-        exit 1
+        return 1
     fi
-    RUN_DIR=${TEST_BUCKET_MOUNT_POINT_1}/${1}
-    mkdir -p ${RUN_DIR}
-    cd ${RUN_DIR}
+    local RUN_DIR="${TEST_BUCKET_MOUNT_POINT_1}/${1}"
+    mkdir -p "${RUN_DIR}"
+    cd "${RUN_DIR}"
 }
 
 function clean_run_dir {
-    if [  -d ${RUN_DIR} ]; then
-        rm -rf ${RUN_DIR} || echo "Error removing ${RUN_DIR}"
+    if [ "${TEST_BUCKET_MOUNT_POINT_1}" = "" ]; then
+        echo "TEST_BUCKET_MOUNT_POINT_1 variable not set"
+        return 1
+    fi
+    local RUN_DIR="${TEST_BUCKET_MOUNT_POINT_1}/${1}"
+
+    if [ -d "${RUN_DIR}" ]; then
+        rm -rf "${RUN_DIR}" || echo "Error removing ${RUN_DIR}"
     fi
 }
 
@@ -204,14 +222,14 @@ function init_suite {
 #   report_pass TEST_NAME
 function report_pass {
     echo "$1 passed"
-    TEST_PASSED_LIST+=($1)
+    TEST_PASSED_LIST+=("$1")
 }
 
 # Report a failing test case
 #   report_fail TEST_NAME
 function report_fail {
     echo "$1 failed"
-    TEST_FAILED_LIST+=($1)
+    TEST_FAILED_LIST+=("$1")
 }
 
 # Add tests to the suite
@@ -229,39 +247,67 @@ function describe {
 # Runs each test in a suite and summarizes results.  The list of
 # tests added by add_tests() is called with CWD set to a tmp
 # directory in the bucket.  An attempt to clean this directory is
-# made after the test run.  
+# made after the test run.
 function run_suite {
-   orig_dir=$PWD
-   key_prefix="testrun-$RANDOM"
-   cd_run_dir $key_prefix
-   for t in "${TEST_LIST[@]}"; do
-       # Ensure test input name differs every iteration
-       TEST_TEXT_FILE=test-s3fs.txt-$RANDOM
-       TEST_DIR=testdir-$RANDOM
-       $t $key_prefix && rc=$? || rc=$?
+   orig_dir="${PWD}"
+   key_prefix="testrun-${RANDOM}"
 
-       if [[ $rc == 0 ]] ; then
-           report_pass $t
+   if ! cd_run_dir "${key_prefix}"; then
+       return 1
+   fi
+
+   RANDOM_NUM=0
+
+   for t in "${TEST_LIST[@]}"; do
+       # Make random string
+       RANDOM_NUM=$((RANDOM_NUM + 1))
+       RANDOM_STR=$(printf '%03d' "${RANDOM_NUM}")
+
+       # Ensure test input name differs every iteration
+       TEST_TEXT_FILE="test-s3fs-${RANDOM_STR}.txt"
+       TEST_DIR="testdir-${RANDOM_STR}"
+       # shellcheck disable=SC2034
+       ALT_TEST_TEXT_FILE="test-s3fs-ALT-${RANDOM_STR}.txt"
+       # shellcheck disable=SC2034
+       BIG_FILE="big-file-s3fs-${RANDOM_STR}.txt"
+
+       # The following sequence runs tests in a subshell to allow continuation
+       # on test failure, but still allowing errexit to be in effect during
+       # the test.
+       #
+       # See:
+       #     https://groups.google.com/d/msg/gnu.bash.bug/NCK_0GmIv2M/dkeZ9MFhPOIJ
+       # Other ways of trying to capture the return value will also disable
+       # errexit in the function due to bash... compliance with POSIX?
+       set +o errexit
+       (set -o errexit; $t $key_prefix)
+       # shellcheck disable=SC2181
+       if [ $? == 0 ]; then
+           report_pass "${t}"
        else
-           report_fail $t
+           report_fail "${t}"
        fi
+       set -o errexit
    done
-   cd ${orig_dir}
-   clean_run_dir
+
+   cd "${orig_dir}"
+   if ! clean_run_dir "${key_prefix}"; then
+       return 1
+   fi
 
    for t in "${TEST_PASSED_LIST[@]}"; do
-       echo "PASS: $t"
+       echo "PASS: ${t}"
    done
    for t in "${TEST_FAILED_LIST[@]}"; do
-       echo "FAIL: $t"
+       echo "FAIL: ${t}"
    done
 
-   passed=${#TEST_PASSED_LIST[@]} 
-   failed=${#TEST_FAILED_LIST[@]} 
+   local passed=${#TEST_PASSED_LIST[@]}
+   local failed=${#TEST_FAILED_LIST[@]}
 
-   echo "SUMMARY for $0: $passed tests passed.  $failed tests failed."
+   echo "SUMMARY for $0: ${passed} tests passed.  ${failed} tests failed."
 
-   if [[ $failed != 0 ]]; then
+   if [[ "${failed}" != 0 ]]; then
        return 1
    else
        return 0
@@ -269,81 +315,210 @@ function run_suite {
 }
 
 function get_ctime() {
-    if [ `uname` = "Darwin" ]; then
-        stat -f "%c" "$1"
-    else
-        stat -c "%Z" "$1"
-    fi
+    # ex: "1657504903.019784214"
+    "${STAT_BIN[@]}" --format "%.9Z" "$1"
 }
 
 function get_mtime() {
-    if [ `uname` = "Darwin" ]; then
-        stat -f "%m" "$1"
-    else
-        stat -c "%Y" "$1"
-    fi
+    # ex: "1657504903.019784214"
+    "${STAT_BIN[@]}" --format "%.9Y" "$1"
 }
 
 function get_atime() {
-    if [ `uname` = "Darwin" ]; then
-        stat -f "%a" "$1"
-    else
-        stat -c "%X" "$1"
-    fi
+    # ex: "1657504903.019784214"
+    "${STAT_BIN[@]}" --format "%.9X" "$1"
 }
 
 function get_permissions() {
-    if [ `uname` = "Darwin" ]; then
-        stat -f "%p" "$1"
-    else
-        stat -c "%a" "$1"
-    fi
+    "${STAT_BIN[@]}" --format "%a" "$1"
+}
+
+function get_user_and_group() {
+    "${STAT_BIN[@]}" --format "%u:%g" "$1"
 }
 
 function check_content_type() {
-    INFO_STR=`aws_cli s3api head-object --bucket ${TEST_BUCKET_1} --key $1`
-    if [[ "${INFO_STR}" != *"$2"* ]]
+    local INFO_STR
+    TEMPNAME="$(mktemp)"
+    s3_head "${TEST_BUCKET_1}/$1" --dump-header "$TEMPNAME"
+    INFO_STR=$(sed -n 's/^Content-Type: //pi' "$TEMPNAME" | tr -d '\r\n')
+    rm -f "$TEMPNAME"
+    if [ "${INFO_STR}" != "$2" ]
     then
-        echo "moved file content-type is not as expected expected:$2 got:${INFO_STR}"
-        exit 1
+        echo "Expected Content-Type: $2 but got: ${INFO_STR}"
+        return 1
     fi
 }
 
 function get_disk_avail_size() {
-    DISK_AVAIL_SIZE=`BLOCKSIZE=$((1024 * 1024)) df $1 | awk '{print $4}' | tail -n 1`
-    echo ${DISK_AVAIL_SIZE}
+    local DISK_AVAIL_SIZE
+    read -r _ _ _ DISK_AVAIL_SIZE _ < <(BLOCKSIZE=$((1024 * 1024)) df "$1" | tail -n 1)
+    echo "${DISK_AVAIL_SIZE}"
 }
 
-function aws_cli() {
-    FLAGS=""
-    if [ -n "${S3FS_PROFILE}" ]; then
-        FLAGS="--profile ${S3FS_PROFILE}"
+# When s3fs runs with use_sse=custom, objects written through the mount
+# are encrypted, and reading or replacing them from outside of s3fs
+# needs the same key.  While S3FS_SSE_CUSTOM_KEYFILE is exported, the
+# object helpers below send the SSE-C headers for the first key in that
+# file, which is the key that s3fs encrypts new objects with.
+function set_sse_curl_args() {
+    SSE_CURL_ARGS=()
+    if [ -n "${S3FS_SSE_CUSTOM_KEYFILE:-}" ]; then
+        local KEY KEY_MD5
+        KEY=$(head -n 1 "${S3FS_SSE_CUSTOM_KEYFILE}")
+        KEY_MD5=$(echo "${KEY}" | openssl base64 -d | openssl md5 -binary | base64)
+        SSE_CURL_ARGS=(
+            --header "x-amz-server-side-encryption-customer-algorithm: AES256"
+            --header "x-amz-server-side-encryption-customer-key: ${KEY}"
+            --header "x-amz-server-side-encryption-customer-key-md5: ${KEY_MD5}"
+        )
     fi
-    aws $* --endpoint-url "${S3_URL}" --no-verify-ssl $FLAGS
+}
+
+function s3_head() {
+    local S3_PATH=$1
+    shift
+    set_sse_curl_args
+    curl --aws-sigv4 "aws:amz:$S3_ENDPOINT:s3" --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+        --cacert "$S3PROXY_CACERT_FILE" --fail --silent \
+        "${SSE_CURL_ARGS[@]}" \
+        "$@" \
+        --head "$S3_URL/$S3_PATH"
+}
+
+# Prints the keys under a prefix, one per line.  The keys are listed URL
+# encoded, so that a key with any byte is valid XML, and decoded here.
+function s3_list_keys() {
+    local S3_BUCKET=$1
+    local S3_PREFIX=$2
+    curl --aws-sigv4 "aws:amz:$S3_ENDPOINT:s3" --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+        --cacert "$S3PROXY_CACERT_FILE" --fail --silent --get \
+        --data "list-type=2" --data "encoding-type=url" \
+        --data-urlencode "prefix=${S3_PREFIX}" \
+        "$S3_URL/$S3_BUCKET" \
+        | { grep -o '<Key>[^<]*</Key>' || true; } | sed -e 's/<Key>//' -e 's#</Key>##' \
+        | while read -r KEY; do printf '%b\n' "${KEY//%/\\x}"; done
+}
+
+function s3_mb() {
+    local S3_BUCKET=$1
+    curl --aws-sigv4 "aws:amz:$S3_ENDPOINT:s3" --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+        --cacert "$S3PROXY_CACERT_FILE" --fail --silent \
+        --request PUT "$S3_URL/$S3_BUCKET"
+}
+
+function s3_cp() {
+    local S3_PATH=$1
+    shift
+    TEMPNAME="$(mktemp)"
+    cat > "$TEMPNAME"
+    # TODO: use filenames instead of stdin?
+    # curl's --data-binary defaults Content-Type to
+    # application/x-www-form-urlencoded, which makes Jetty 12 in S3Proxy 3.1.0
+    # drain the body as form parameters before x-amz-content-sha256 is
+    # verified, producing a 400 mismatch.  Default to application/octet-stream
+    # unless the caller passed an explicit Content-Type.
+    local CONTENT_TYPE_HEADER=(--header "Content-Type: application/octet-stream")
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            Content-Type:*) CONTENT_TYPE_HEADER=(); break ;;
+        esac
+    done
+    set_sse_curl_args
+    curl --aws-sigv4 "aws:amz:$S3_ENDPOINT:s3" --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+        --cacert "$S3PROXY_CACERT_FILE" --fail --silent \
+        --header "Content-Length: $(wc -c < "$TEMPNAME")" \
+        "${CONTENT_TYPE_HEADER[@]}" \
+        "${SSE_CURL_ARGS[@]}" \
+        "$@" \
+        --request PUT --data-binary "@$TEMPNAME" "$S3_URL/$S3_PATH"
+    rm -f "$TEMPNAME"
+}
+
+#
+# Checking header elements
+#
+# grep -q may exit before a line-buffered writer finishes, which kills the
+# writer with SIGPIPE and fails the pipeline under pipefail.  Feed it from
+# a here-string instead so there is no writer in the pipeline.
+#
+function has_header() {
+    grep -qi "^$2" <<< "$1"
 }
 
 function wait_for_port() {
-    PORT=$1
-    for i in $(seq 30); do
+    local PORT="$1"
+    for _ in $(seq 300); do
         if exec 3<>"/dev/tcp/127.0.0.1/${PORT}";
         then
             exec 3<&-  # Close for read
             exec 3>&-  # Close for write
-            break
+            return 0
         fi
-        sleep 1
+        sleep 0.1
     done
+    echo "timeout waiting for port ${PORT}"
+    return 1
 }
 
-function make_random_string() {
-    if [ -n "$1" ]; then
-        END_POS=$1
+function s3fs_args() {
+    if [ "$(uname)" = "Darwin" ]; then
+        ps -o args -p "${S3FS_PID}" | tail -n +2
     else
-        END_POS=8
+        ps -o args -p "${S3FS_PID}" --no-headers
     fi
+}
 
-    ${BASE64_BIN} --wrap=0 < /dev/urandom | tr -d /+ | head -c ${END_POS}
+#
+# $1:    sleep seconds
+# $2:    OS type(ex. 'Darwin', unset(means all os type))
+#
+# [NOTE]
+# Sleeps to let timing-sensitive state settle, optionally only on
+# one OS type.
+# This previously waited out fuse-t's NFS timestamp granularity on
+# macos, but fuse-t(1.2.7 and later) passes nanosecond timestamps
+# through, so timestamp resolution is no longer a reason to wait.
+#
+function wait_ostype() {
+    if [ -z "$2" ] || uname | grep -q "$2"; then
+        if [ -n "$1" ] && ! (echo "$1" | grep -q '[^0-9]'); then
+            sleep "$1"
+        fi
+    fi
+}
 
+#
+# Avoid extended attribute errors when copying on macos(fuse-t)
+#
+# [NOTE][FIXME]
+# This avoids an error that occurs when copying (cp command) on macos
+# (fuse-t) stating that extended attributes cannot be copied and the
+# exit code becomes anything other than 0.
+#Even if this error occurs, the copy itself is successful.
+#
+# This issue is currently(2024/11/7) still in the process of being
+# fixed, so we will wait and see.
+# This issue only occurred in the test_multipart_mix test with the
+# nocopyapi option, but in macos-13 Github Actions, it occurs in
+# some tests that use the use_xattr option.
+#
+function cp_avoid_xattr_err() {
+    if uname | grep -q Darwin; then
+        if ! cp "$@"; then
+            return $?
+        fi
+    else
+        local CP_RESULT="";
+        if ! CP_RESULT=$(cp "$@" 2>&1); then
+            local CP_EXITCODE=$?
+            if ! echo "${CP_RESULT}" | grep -q -i "Result too large"; then
+                return "${CP_EXITCODE}"
+            fi
+            echo "[FIXME: MACOS] ${CP_RESULT}"
+        fi
+    fi
     return 0
 }
 

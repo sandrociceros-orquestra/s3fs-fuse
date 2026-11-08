@@ -21,21 +21,39 @@
 #ifndef S3FS_ADDHEAD_H_
 #define S3FS_ADDHEAD_H_
 
+#include <memory>
 #include <regex.h>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "metaheader.h"
 
 //----------------------------------------------
 // Structure / Typedef
 //----------------------------------------------
-typedef struct add_header{
-    regex_t*      pregex;         // not NULL means using regex, NULL means comparing suffix directly.
+using RegexPtr = std::unique_ptr<regex_t, decltype(&regfree)>;
+
+struct add_header{
+    add_header(RegexPtr pregex, std::string basestring, std::string headkey, std::string headvalue)
+        : pregex(std::move(pregex))
+        , basestring(std::move(basestring))
+        , headkey(std::move(headkey))
+        , headvalue(std::move(headvalue))
+    {}
+
+    add_header(const add_header&) = delete;
+    add_header(add_header&& val) = default;
+    add_header& operator=(const add_header&) = delete;
+    add_header& operator=(add_header&&) = delete;
+
+    RegexPtr      pregex;         // not nullptr means using regex, nullptr means comparing suffix directly.
     std::string   basestring;
     std::string   headkey;
     std::string   headvalue;
-}ADDHEAD;
+};
 
-typedef std::vector<ADDHEAD *> addheadlist_t;
+using addheadlist_t = std::vector<add_header>;
 
 //----------------------------------------------
 // Class AdditionalHeader
@@ -43,17 +61,25 @@ typedef std::vector<ADDHEAD *> addheadlist_t;
 class AdditionalHeader
 {
     private:
-        static AdditionalHeader singleton;
-        bool                    is_enable;
-        addheadlist_t           addheadlist;
+        bool            is_enable = false;
+        addheadlist_t   addheadlist;
 
     protected:
-        AdditionalHeader();
+        AdditionalHeader() = default;
         ~AdditionalHeader();
 
     public:
+        AdditionalHeader(const AdditionalHeader&) = delete;
+        AdditionalHeader(AdditionalHeader&&) = delete;
+        AdditionalHeader& operator=(const AdditionalHeader&) = delete;
+        AdditionalHeader& operator=(AdditionalHeader&&) = delete;
+
         // Reference singleton
-        static AdditionalHeader* get() { return &singleton; }
+        static AdditionalHeader* get()
+        {
+            static AdditionalHeader singleton;
+            return &singleton;
+        }
 
         bool Load(const char* file);
         void Unload();

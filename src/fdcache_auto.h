@@ -21,8 +21,12 @@
 #ifndef S3FS_FDCACHE_AUTO_H_
 #define S3FS_FDCACHE_AUTO_H_
 
-#include "autolock.h"
-#include "fdcache_entity.h"
+#include <fcntl.h>
+
+#include "metaheader.h"
+#include "filetimes.h"
+
+class FdEntity;
 
 //------------------------------------------------
 // class AutoFdEntity
@@ -38,21 +42,23 @@ class AutoFdEntity
       FdEntity* pFdEntity;
       int       pseudo_fd;
 
-  private:
-      AutoFdEntity(AutoFdEntity& other);
-      bool operator=(AutoFdEntity& other);
-
   public:
       AutoFdEntity();
       ~AutoFdEntity();
+      AutoFdEntity(const AutoFdEntity&) = delete;
+      AutoFdEntity(AutoFdEntity&&) = delete;
+      AutoFdEntity& operator=(const AutoFdEntity&) = delete;
+      AutoFdEntity& operator=(AutoFdEntity&&) = delete;
 
       bool Close();
       int Detach();
-      bool Attach(const char* path, int existfd);
+      FdEntity* Attach(const char* path, int existfd);
+      FdEntity* AttachByPseudoFd(int existfd);
       int GetPseudoFd() const { return pseudo_fd; }
 
-      FdEntity* Open(const char* path, headers_t* pmeta, off_t size, time_t time, int flags, bool force_tmpfile, bool is_create, AutoLock::Type type);
+      FdEntity* Open(const char* path, const headers_t* pmeta, off_t size, const FileTimes& ts_times, int flags, bool force_tmpfile, bool is_create, bool ignore_modify, int* error = nullptr);
       FdEntity* GetExistFdEntity(const char* path, int existfd = -1);
+      FdEntity* GetExistFdEntityByPseudoFd(int existfd);
       FdEntity* OpenExistFdEntity(const char* path, int flags = O_RDONLY);
 };
 

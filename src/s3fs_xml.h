@@ -22,28 +22,78 @@
 #define S3FS_S3FS_XML_H_
 
 #include <libxml/xpath.h>
-#include <libxml/xpathInternals.h>
-#include <libxml/tree.h>
-
+#include <libxml/parser.h>  // [NOTE] include this header in some environments
+#include <memory>
+#include <optional>
 #include <string>
+#include <array>
+#include <cstring>
 
-#include "s3objlist.h"
 #include "mpu_util.h"
+
+// S3 responses never use DTDs — block external entity loading.
+#ifdef XML_PARSE_NO_XXE
+inline constexpr int S3FS_XML_PARSE_FLAGS = XML_PARSE_NO_XXE;
+#else
+inline constexpr int S3FS_XML_PARSE_FLAGS = XML_PARSE_NONET;
+#endif
+
+class S3ObjList;
+
+using unique_ptr_xmlChar         = std::unique_ptr<xmlChar, decltype(xmlFree)>;
+using unique_ptr_xmlXPathObject  = std::unique_ptr<xmlXPathObject, decltype(&xmlXPathFreeObject)>;
+using unique_ptr_xmlXPathContext = std::unique_ptr<xmlXPathContext, decltype(&xmlXPathFreeContext)>;
+using unique_ptr_xmlDoc          = std::unique_ptr<xmlDoc, decltype(&xmlFreeDoc)>;
+
+//-------------------------------------------------------------------
+// Utility Class
+//-------------------------------------------------------------------
+class s3fsXmlBufferParserError
+{
+    private:
+        static constexpr int  ERROR_BUFFER_SIZE = 1024;
+        std::array<char, ERROR_BUFFER_SIZE> error_buffer{};
+
+        static void ParserErrorHandler(void* ctx, const char *msg, ...)
+        {
+            auto* errbuf = static_cast<char*>(ctx);
+            if(errbuf){
+                va_list args;
+                va_start(args, msg);
+                vsnprintf(errbuf + strlen(errbuf), ERROR_BUFFER_SIZE - strlen(errbuf) - 1, msg, args);
+                va_end(args);
+            }
+        }
+
+    public:
+        void SetXmlParseError()
+        {
+            error_buffer.fill(0);
+            xmlSetGenericErrorFunc(error_buffer.data(), s3fsXmlBufferParserError::ParserErrorHandler);
+        }
+
+        std::string GetXmlParseError() const
+        {
+            return strlen(error_buffer.data()) ? error_buffer.data() : "";
+        }
+
+        bool IsXmlParseError() const
+        {
+            return (0 < strlen(error_buffer.data()));
+        }
+};
 
 //-------------------------------------------------------------------
 // Functions
 //-------------------------------------------------------------------
 bool is_truncated(xmlDocPtr doc);
-int append_objects_from_xml_ex(const char* path, xmlDocPtr doc, xmlXPathContextPtr ctx, const char* ex_contents, const char* ex_key, const char* ex_etag, int isCPrefix, S3ObjList& head);
+int append_objects_from_xml_ex(const char* path, xmlDocPtr doc, xmlXPathContextPtr ctx, const char* ex_contents, const char* ex_key, const char* ex_etag, const char* ex_size, const char* ex_lastmod, int isCPrefix, S3ObjList& head, bool prefix);
 int append_objects_from_xml(const char* path, xmlDocPtr doc, S3ObjList& head);
-xmlChar* get_next_continuation_token(xmlDocPtr doc);
-xmlChar* get_next_marker(xmlDocPtr doc);
+unique_ptr_xmlChar get_next_continuation_token(xmlDocPtr doc);
+unique_ptr_xmlChar get_next_marker(xmlDocPtr doc);
 bool get_incomp_mpu_list(xmlDocPtr doc, incomp_mpu_list_t& list);
 
-bool simple_parse_xml(const char* data, size_t len, const char* key, std::string& value);
-
-bool init_parser_xml_lock();
-bool destroy_parser_xml_lock();
+std::optional<std::string> simple_parse_xml(const char* data, size_t len, const char* key);
 
 #endif // S3FS_S3FS_XML_H_
 

@@ -27,28 +27,27 @@ source test-utils.sh
 function test_create_empty_file {
     describe "Testing creating an empty file ..."
 
-    OBJECT_NAME="$(basename $PWD)/${TEST_TEXT_FILE}"
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
 
-    touch ${TEST_TEXT_FILE}
+    touch "${TEST_TEXT_FILE}"
 
     check_file_size "${TEST_TEXT_FILE}" 0
 
-    aws_cli s3api head-object --bucket "${TEST_BUCKET_1}" --key "${OBJECT_NAME}"
+    s3_head "${TEST_BUCKET_1}/${OBJECT_NAME}"
 
     rm_test_file
 }
 
 function test_append_file {
     describe "Testing append to file ..."
-    TEST_INPUT="echo ${TEST_TEXT} to ${TEST_TEXT_FILE}"
+    local TEST_INPUT="echo ${TEST_TEXT} to ${TEST_TEXT_FILE}"
 
     # Write a small test file
-    for x in `seq 1 $TEST_TEXT_FILE_LENGTH`
-    do
-        echo $TEST_INPUT
-    done > ${TEST_TEXT_FILE}
+    for x in $(seq 1 "${TEST_TEXT_FILE_LENGTH}"); do
+        echo "${TEST_INPUT}"
+    done > "${TEST_TEXT_FILE}"
 
-    check_file_size "${TEST_TEXT_FILE}" $(($TEST_TEXT_FILE_LENGTH * $(echo $TEST_INPUT | wc -c)))
+    check_file_size "${TEST_TEXT_FILE}" $((TEST_TEXT_FILE_LENGTH * $((${#TEST_INPUT} + 1)) ))
 
     rm_test_file
 }
@@ -56,10 +55,10 @@ function test_append_file {
 function test_truncate_file {
     describe "Testing truncate file ..."
     # Write a small test file
-    echo "${TEST_TEXT}" > ${TEST_TEXT_FILE}
+    echo "${TEST_TEXT}" > "${TEST_TEXT_FILE}"
 
     # Truncate file to 0 length.  This should trigger open(path, O_RDWR | O_TRUNC...)
-    : > ${TEST_TEXT_FILE}
+    : > "${TEST_TEXT_FILE}"
 
     check_file_size "${TEST_TEXT_FILE}" 0
 
@@ -72,36 +71,145 @@ function test_truncate_upload {
     # This file size uses multipart, mix upload when uploading.
     # We will test these cases.
 
-    rm_test_file ${BIG_FILE}
+    rm_test_file "${BIG_FILE}"
 
-    ${TRUNCATE_BIN} ${BIG_FILE} -s ${BIG_FILE_LENGTH}
+    "${TRUNCATE_BIN}" "${BIG_FILE}" -s "${BIG_FILE_LENGTH}"
 
-    rm_test_file ${BIG_FILE}
+    rm_test_file "${BIG_FILE}"
 }
 
 function test_truncate_empty_file {
     describe "Testing truncate empty file ..."
     # Write an empty test file
-    touch ${TEST_TEXT_FILE}
+    touch "${TEST_TEXT_FILE}"
 
     # Truncate the file to 1024 length
-    t_size=1024
-    ${TRUNCATE_BIN} ${TEST_TEXT_FILE} -s $t_size
+    local t_size=1024
+    "${TRUNCATE_BIN}" "${TEST_TEXT_FILE}" -s "${t_size}"
 
-    check_file_size "${TEST_TEXT_FILE}" $t_size
+    check_file_size "${TEST_TEXT_FILE}" "${t_size}"
 
     rm_test_file
+}
+
+function test_truncate_shrink_file {
+    describe "Testing truncate shrinking large binary file ..."
+
+    local BIG_TRUNCATE_TEST_FILE="big-truncate-test.bin"
+    local t_size=$((1024 * 1024 * 32 + 64))
+
+    ../../junk_data $((64 * 1024 * 1024)) > "${TEMP_DIR}/${BIG_TRUNCATE_TEST_FILE}"
+    cp "${TEMP_DIR}/${BIG_TRUNCATE_TEST_FILE}" "${BIG_TRUNCATE_TEST_FILE}"
+
+    "${TRUNCATE_BIN}" "${TEMP_DIR}/${BIG_TRUNCATE_TEST_FILE}" -s "${t_size}"
+    "${TRUNCATE_BIN}" "${BIG_TRUNCATE_TEST_FILE}" -s "${t_size}"
+
+    if ! cmp "${TEMP_DIR}/${BIG_TRUNCATE_TEST_FILE}" "${BIG_TRUNCATE_TEST_FILE}"; then
+       return 1
+    fi
+
+    rm -f "${TEMP_DIR}/${BIG_TRUNCATE_TEST_FILE}"
+    rm_test_file "${BIG_TRUNCATE_TEST_FILE}"
+}
+
+function test_truncate_grow_file {
+    describe "Testing truncate growing large binary file ..."
+
+    local BIG_GROW_TEST_FILE="big-grow-test.bin"
+    local t_size=$((1024 * 1024 * 30 + 64))
+
+    ../../junk_data $((25 * 1024 * 1024)) > "${TEMP_DIR}/${BIG_GROW_TEST_FILE}"
+    cp "${TEMP_DIR}/${BIG_GROW_TEST_FILE}" "${BIG_GROW_TEST_FILE}"
+
+    "${TRUNCATE_BIN}" "${TEMP_DIR}/${BIG_GROW_TEST_FILE}" -s "${t_size}"
+    "${TRUNCATE_BIN}" "${BIG_GROW_TEST_FILE}" -s "${t_size}"
+
+    if ! cmp "${TEMP_DIR}/${BIG_GROW_TEST_FILE}" "${BIG_GROW_TEST_FILE}"; then
+       return 1
+    fi
+
+    rm -f "${TEMP_DIR}/${BIG_GROW_TEST_FILE}"
+    rm_test_file "${BIG_GROW_TEST_FILE}"
+}
+
+function test_truncate_shrink_read_file {
+    describe "Testing truncate(shrink) and read file ..."
+
+    # Initiate file size is 1024, and shrink file size is 512
+    local init_size=1024
+    local shrink_size=512
+
+    # create file
+    dd if=/dev/urandom of="${TEST_TEXT_FILE}" bs="${init_size}" count=1
+
+    # truncate(shrink) file and read it before flushing
+    ../../truncate_read_file "${TEST_TEXT_FILE}" "${shrink_size}"
+
+    # check file size
+    check_file_size "${TEST_TEXT_FILE}" "${shrink_size}"
+
+    # Truncate the file to 1024 length
+    local t_size=1024
+
+    rm_test_file
+}
+
+function test_truncate_closed_file {
+    describe "Testing truncate(2) on a file which is not open ..."
+
+    # [NOTE]
+    # path_truncate calls truncate(2) with a path, unlike the truncate
+    # command which opens the file and calls ftruncate(2). The file is
+    # not open, so s3fs must upload the resized file by itself.
+    #
+    printf '0123456789' > "${TEST_TEXT_FILE}"
+
+    ../../path_truncate "${TEST_TEXT_FILE}" 4
+    check_file_size "${TEST_TEXT_FILE}" 4
+    cmp "${TEST_TEXT_FILE}" <(printf '0123')
+
+    ../../path_truncate "${TEST_TEXT_FILE}" 8
+    check_file_size "${TEST_TEXT_FILE}" 8
+    cmp "${TEST_TEXT_FILE}" <(printf '0123\0\0\0\0')
+
+    rm_test_file
+}
+
+function test_unlink_open_file {
+    describe "Testing operations on a file which is unlinked while open ..."
+
+    # This exercises the file handle based FUSE handlers after the file
+    # has lost its path.  With -o hard_remove, FUSE passes a null path
+    # to these handlers and s3fs must serve them by the pseudo fd alone
+    # (see issue #2903).  Without hard_remove, FUSE hides the file with
+    # a .fuse_hidden name instead.
+    #
+    # With hard_remove, fstat(2) may fail in libfuse itself(with ESTALE
+    # since libfuse 3.12, ENOENT before that): the kernel sends GETATTR
+    # without the file handle, which cannot be answered for a file
+    # without a path once the kernel attribute cache has expired.
+    if s3fs_args | grep -q hard_remove; then
+        ../../unlink_open_file "${TEST_TEXT_FILE}" allow_fstat_failure
+    else
+        ../../unlink_open_file "${TEST_TEXT_FILE}"
+    fi
+
+    # the file must not exist(and must not be recreated) after the last close
+    if [ -e "${TEST_TEXT_FILE}" ]; then
+        echo "file ${TEST_TEXT_FILE} exists after unlink and close"
+        return 1
+    fi
 }
 
 function test_mv_file {
     describe "Testing mv file function ..."
     # if the rename file exists, delete it
-    if [ -e $ALT_TEST_TEXT_FILE ]
+    if [ -e "${ALT_TEST_TEXT_FILE}" ]
     then
-       rm $ALT_TEST_TEXT_FILE
+       rm "${ALT_TEST_TEXT_FILE}"
     fi
 
-    if [ -e $ALT_TEST_TEXT_FILE ]
+    if [ -e "${ALT_TEST_TEXT_FILE}" ]
     then
        echo "Could not delete file ${ALT_TEST_TEXT_FILE}, it still exists"
        return 1
@@ -111,24 +219,24 @@ function test_mv_file {
     mk_test_file
 
     # save file length
-    ALT_TEXT_LENGTH=`wc -c $TEST_TEXT_FILE | awk '{print $1}'`
+    local ALT_TEXT_LENGTH; ALT_TEXT_LENGTH=$(wc -c < "${TEST_TEXT_FILE}")
 
     #rename the test file
-    mv $TEST_TEXT_FILE $ALT_TEST_TEXT_FILE
-    if [ ! -e $ALT_TEST_TEXT_FILE ]
+    mv "${TEST_TEXT_FILE}" "${ALT_TEST_TEXT_FILE}"
+    if [ ! -e "${ALT_TEST_TEXT_FILE}" ]
     then
        echo "Could not move file"
        return 1
     fi
-    
+
     #check the renamed file content-type
     if [ -f "/etc/mime.types" ]
     then
-      check_content_type "$1/$ALT_TEST_TEXT_FILE" "text/plain"
+      check_content_type "$1/${ALT_TEST_TEXT_FILE}" "text/plain"
     fi
 
     # Check the contents of the alt file
-    ALT_FILE_LENGTH=`wc -c $ALT_TEST_TEXT_FILE | awk '{print $1}'`
+    local ALT_FILE_LENGTH; ALT_FILE_LENGTH=$(wc -c < "${ALT_TEST_TEXT_FILE}")
     if [ "$ALT_FILE_LENGTH" -ne "$ALT_TEXT_LENGTH" ]
     then
        echo "moved file length is not as expected expected: $ALT_TEXT_LENGTH  got: $ALT_FILE_LENGTH"
@@ -136,38 +244,76 @@ function test_mv_file {
     fi
 
     # clean up
-    rm_test_file $ALT_TEST_TEXT_FILE
+    rm_test_file "${ALT_TEST_TEXT_FILE}"
 }
 
 function test_mv_to_exist_file {
     describe "Testing mv file to exist file function ..."
 
-    BIG_MV_FILE_BLOCK_SIZE=$((BIG_FILE_BLOCK_SIZE + 1))
+    local BIG_MV_FILE_BLOCK_SIZE=$((BIG_FILE_BLOCK_SIZE + 1))
 
-    ../../junk_data $(($BIG_FILE_BLOCK_SIZE * $BIG_FILE_COUNT)) > "${BIG_FILE}"
-    ../../junk_data $(($BIG_FILE_BLOCK_SIZE * $BIG_FILE_COUNT)) > "${BIG_FILE}-mv"
+    ../../junk_data $((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT)) > "${BIG_FILE}"
+    ../../junk_data $((BIG_MV_FILE_BLOCK_SIZE * BIG_FILE_COUNT)) > "${BIG_FILE}-mv"
 
-    mv ${BIG_FILE} ${BIG_FILE}-mv
+    mv "${BIG_FILE}" "${BIG_FILE}-mv"
 
     rm_test_file "${BIG_FILE}-mv"
 }
 
+function test_rename_onto_open_file {
+    describe "Testing rename onto an open file ..."
+
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${ALT_TEST_TEXT_FILE}"
+
+    # Renaming an open file onto another open file leaves two descriptors on
+    # the same path.  s3fs must keep the fd entity of the replaced file for
+    # the descriptor which still refers to it, instead of destroying it or
+    # letting it answer for the path, and must never write it back over the
+    # object which was renamed in.
+    ../../rename_onto_open_file "${TEST_TEXT_FILE}" "${ALT_TEST_TEXT_FILE}"
+
+    # [NOTE]
+    # Check the object instead of the mount point: the test program has just
+    # read the renamed in file, so a write back of the replaced file would be
+    # hidden by the kernel page cache.  The renamed in file is 6 bytes long
+    # and the file it replaced was 25 bytes long.
+    #
+    s3_head "${TEST_BUCKET_1}/${OBJECT_NAME}" | grep -qiE '^Content-Length: 6[[:space:]]*$'
+
+    # The replaced file must not be written anywhere else either: the
+    # destination is the only object under its name, and no internal
+    # temporary path of s3fs reaches the bucket.
+    #
+    local KEYS; KEYS=$(s3_list_keys "${TEST_BUCKET_1}" "${OBJECT_NAME}")
+    if [ "${KEYS}" != "${OBJECT_NAME}" ]; then
+        echo "unexpected objects under ${OBJECT_NAME}: ${KEYS}"
+        return 1
+    fi
+    KEYS=$(s3_list_keys "${TEST_BUCKET_1}" " __S3FS_")
+    if [ -n "${KEYS}" ]; then
+        echo "unexpected objects with an s3fs temporary path: ${KEYS}"
+        return 1
+    fi
+
+    rm_test_file "${ALT_TEST_TEXT_FILE}"
+}
+
 function test_mv_empty_directory {
     describe "Testing mv directory function ..."
-    if [ -e $TEST_DIR ]; then
+    if [ -e "${TEST_DIR}" ]; then
        echo "Unexpected, this file/directory exists: ${TEST_DIR}"
        return 1
     fi
 
     mk_test_dir
 
-    mv ${TEST_DIR} ${TEST_DIR}_rename
+    mv "${TEST_DIR}" "${TEST_DIR}_rename"
     if [ ! -d "${TEST_DIR}_rename" ]; then
        echo "Directory ${TEST_DIR} was not renamed"
        return 1
     fi
 
-    rmdir ${TEST_DIR}_rename
+    rmdir "${TEST_DIR}_rename"
     if [ -e "${TEST_DIR}_rename" ]; then
        echo "Could not remove the test directory, it still exists: ${TEST_DIR}_rename"
        return 1
@@ -176,22 +322,22 @@ function test_mv_empty_directory {
 
 function test_mv_nonempty_directory {
     describe "Testing mv directory function ..."
-    if [ -e $TEST_DIR ]; then
+    if [ -e "${TEST_DIR}" ]; then
        echo "Unexpected, this file/directory exists: ${TEST_DIR}"
        return 1
     fi
 
     mk_test_dir
 
-    touch ${TEST_DIR}/file
+    touch "${TEST_DIR}"/file
 
-    mv ${TEST_DIR} ${TEST_DIR}_rename
+    mv "${TEST_DIR}" "${TEST_DIR}_rename"
     if [ ! -d "${TEST_DIR}_rename" ]; then
        echo "Directory ${TEST_DIR} was not renamed"
        return 1
     fi
 
-    rm -r ${TEST_DIR}_rename
+    rm -r "${TEST_DIR}_rename"
     if [ -e "${TEST_DIR}_rename" ]; then
        echo "Could not remove the test directory, it still exists: ${TEST_DIR}_rename"
        return 1
@@ -201,35 +347,35 @@ function test_mv_nonempty_directory {
 function test_redirects {
     describe "Testing redirects ..."
 
-    mk_test_file ABCDEF
+    mk_test_file "ABCDEF"
 
-    CONTENT=`cat $TEST_TEXT_FILE`
+    local CONTENT; CONTENT=$(cat "${TEST_TEXT_FILE}")
 
     if [ "${CONTENT}" != "ABCDEF" ]; then
        echo "CONTENT read is unexpected, got ${CONTENT}, expected ABCDEF"
        return 1
     fi
 
-    echo XYZ > $TEST_TEXT_FILE
+    echo "XYZ" > "${TEST_TEXT_FILE}"
 
-    CONTENT=`cat $TEST_TEXT_FILE`
+    CONTENT=$(cat "${TEST_TEXT_FILE}")
 
-    if [ ${CONTENT} != "XYZ" ]; then
+    if [ "${CONTENT}" != "XYZ" ]; then
        echo "CONTENT read is unexpected, got ${CONTENT}, expected XYZ"
        return 1
     fi
 
-    echo 123456 >> $TEST_TEXT_FILE
+    echo "123456" >> "${TEST_TEXT_FILE}"
 
-    LINE1=`${SED_BIN} -n '1,1p' $TEST_TEXT_FILE`
-    LINE2=`${SED_BIN} -n '2,2p' $TEST_TEXT_FILE`
+    local LINE1; LINE1=$(sed -n '1,1p' "${TEST_TEXT_FILE}")
+    local LINE2; LINE2=$(sed -n '2,2p' "${TEST_TEXT_FILE}")
 
-    if [ ${LINE1} != "XYZ" ]; then
+    if [ "${LINE1}" != "XYZ" ]; then
        echo "LINE1 was not as expected, got ${LINE1}, expected XYZ"
        return 1
     fi
 
-    if [ ${LINE2} != "123456" ]; then
+    if [ "${LINE2}" != "123456" ]; then
        echo "LINE2 was not as expected, got ${LINE2}, expected 123456"
        return 1
     fi
@@ -241,7 +387,7 @@ function test_redirects {
 function test_mkdir_rmdir {
     describe "Testing creation/removal of a directory ..."
 
-    if [ -e $TEST_DIR ]; then
+    if [ -e "${TEST_DIR}" ]; then
        echo "Unexpected, this file/directory exists: ${TEST_DIR}"
        return 1
     fi
@@ -256,15 +402,15 @@ function test_chmod {
     # create the test file again
     mk_test_file
 
-    ORIGINAL_PERMISSIONS=$(get_permissions $TEST_TEXT_FILE)
+    local ORIGINAL_PERMISSIONS; ORIGINAL_PERMISSIONS=$(get_permissions "${TEST_TEXT_FILE}")
 
-    chmod 777 $TEST_TEXT_FILE;
+    chmod 777 "${TEST_TEXT_FILE}";
 
     # if they're the same, we have a problem.
-    CHANGED_PERMISSIONS=$(get_permissions $TEST_TEXT_FILE)
-    if [ $CHANGED_PERMISSIONS == $ORIGINAL_PERMISSIONS ]
+    local CHANGED_PERMISSIONS; CHANGED_PERMISSIONS=$(get_permissions "${TEST_TEXT_FILE}")
+    if [ "${CHANGED_PERMISSIONS}" = "${ORIGINAL_PERMISSIONS}" ]
     then
-      echo "Could not modify $TEST_TEXT_FILE permissions"
+      echo "Could not modify ${TEST_TEXT_FILE} permissions"
       return 1
     fi
 
@@ -278,11 +424,8 @@ function test_chown {
     # create the test file again
     mk_test_file
 
-    if [ `uname` = "Darwin" ]; then
-        ORIGINAL_PERMISSIONS=$(stat -f "%u:%g" $TEST_TEXT_FILE)
-    else
-        ORIGINAL_PERMISSIONS=$(stat --format=%u:%g $TEST_TEXT_FILE)
-    fi
+    local ORIGINAL_PERMISSIONS
+    ORIGINAL_PERMISSIONS=$(get_user_and_group "${TEST_TEXT_FILE}")
 
     # [NOTE]
     # Prevents test interruptions due to permission errors, etc.
@@ -291,21 +434,18 @@ function test_chown {
     # '|| true' was added due to a problem with Travis CI and MacOS
     # and ensure_diskfree option.
     #
-    chown 1000:1000 $TEST_TEXT_FILE || true
+    chown 1000:1000 "${TEST_TEXT_FILE}" || true
 
     # if they're the same, we have a problem.
-    if [ `uname` = "Darwin" ]; then
-        CHANGED_PERMISSIONS=$(stat -f "%u:%g" $TEST_TEXT_FILE)
-    else
-        CHANGED_PERMISSIONS=$(stat --format=%u:%g $TEST_TEXT_FILE)
-    fi
-    if [ $CHANGED_PERMISSIONS == $ORIGINAL_PERMISSIONS ]
+    local CHANGED_PERMISSIONS
+    CHANGED_PERMISSIONS=$(get_user_and_group "${TEST_TEXT_FILE}")
+    if [ "${CHANGED_PERMISSIONS}" = "${ORIGINAL_PERMISSIONS}" ]
     then
-      if [ $ORIGINAL_PERMISSIONS == "1000:1000" ]
+      if [ "${ORIGINAL_PERMISSIONS}" = "1000:1000" ]
       then
         echo "Could not be strict check because original file permission 1000:1000"
       else
-        echo "Could not modify $TEST_TEXT_FILE ownership($ORIGINAL_PERMISSIONS to 1000:1000)"
+        echo "Could not modify ${TEST_TEXT_FILE} ownership($ORIGINAL_PERMISSIONS to 1000:1000)"
         return 1
       fi
     fi
@@ -319,9 +459,11 @@ function test_list {
     mk_test_file
     mk_test_dir
 
-    file_cnt=$(ls -1 | wc -l)
-    if [ $file_cnt != 2 ]; then
-        echo "Expected 2 file but got $file_cnt"
+    local file_list=(*)
+    local file_cnt=${#file_list[@]}
+    if [ "${file_cnt}" -ne 2 ]; then
+        echo "Expected 2 file but got ${file_cnt}"
+        echo "Files: " "${file_list[@]}"
         return 1
     fi
 
@@ -341,32 +483,309 @@ function test_remove_nonempty_directory {
     rm_test_dir
 }
 
+function test_list_directory_after_failed_rmdir {
+    describe "Test listing a non-empty directory after a failed rmdir ..."
+
+    # [NOTE]
+    # The objects are created with s3_cp(not through the mount
+    # point) like a directory written by another client, so that the
+    # children are not in the stat cache.  s3fs_readdir merges stat
+    # cache entries into its result, which would hide an incomplete
+    # listing cache entry.
+    #
+    local DIR_NAME; DIR_NAME="dir_$(basename "${PWD}")_failed_rmdir"
+    local OBJECT_PREFIX; OBJECT_PREFIX=$(basename "${PWD}")/"${DIR_NAME}"
+    s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/" --header "Content-Type: application/x-directory" < /dev/null
+    echo data1 | s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/file1"
+    echo data2 | s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/file2"
+    echo data3 | s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/file3"
+
+    # rmdir must fail, and must not poison the listing cache with the
+    # truncated(max-keys=2) listing requested for the emptiness check.
+    (
+        set +o pipefail
+        rmdir "${DIR_NAME}" 2>&1 | grep -q "Directory not empty"
+    )
+
+    local FILE_CNT; FILE_CNT=$(find "${DIR_NAME}" -mindepth 1 -maxdepth 1 | wc -l)
+    if [ "${FILE_CNT}" -ne 3 ]; then
+        echo "Expected 3 files in ${DIR_NAME} but got ${FILE_CNT}"
+        return 1
+    fi
+
+    rm -r "${DIR_NAME}"
+}
+
+function test_rename_directory_after_list {
+    describe "Test renaming a directory with a subdirectory after listing it ..."
+
+    # [NOTE]
+    # The objects are created with s3_cp like in
+    # test_list_directory_after_failed_rmdir.
+    #
+    local DIR_NAME; DIR_NAME="dir_$(basename "${PWD}")_rename_after_list"
+    local TO_DIR_NAME; TO_DIR_NAME="${DIR_NAME}_renamed"
+    local OBJECT_PREFIX; OBJECT_PREFIX=$(basename "${PWD}")/"${DIR_NAME}"
+    s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/" --header "Content-Type: application/x-directory" < /dev/null
+    echo direct | s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/file1"
+    s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/subdir/" --header "Content-Type: application/x-directory" < /dev/null
+    echo nested | s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/subdir/file2"
+
+    # Listing the directory stores the one-level list in the listing
+    # cache; the rename must not consume it as the recursive object
+    # list, otherwise objects under the subdirectory are left behind.
+    ls "${DIR_NAME}" > /dev/null
+
+    mv "${DIR_NAME}" "${TO_DIR_NAME}"
+
+    cmp "${TO_DIR_NAME}/file1" <(echo direct)
+    cmp "${TO_DIR_NAME}/subdir/file2" <(echo nested)
+    if [ -e "${DIR_NAME}" ]; then
+        echo "${DIR_NAME} still exists after mv"
+        return 1
+    fi
+
+    rm -r "${TO_DIR_NAME}"
+}
+
+function test_rename_directory_without_subdir_object {
+    describe "Test renaming a directory whose subdirectory has no object ..."
+
+    # [NOTE]
+    # The objects are created with s3_cp like in
+    # test_rename_directory_after_list.  No object is created for the
+    # middle directory, so it exists only as a common prefix and the
+    # rename has to descend into a directory which the bucket does not
+    # name.  Listing the tree first stores a one-level list for every
+    # level in the listing cache, which the rename then consumes.
+    #
+    local DIR_NAME; DIR_NAME="dir_$(basename "${PWD}")_rename_no_subdir_object"
+    local TO_DIR_NAME; TO_DIR_NAME="${DIR_NAME}_renamed"
+    local OBJECT_PREFIX; OBJECT_PREFIX=$(basename "${PWD}")/"${DIR_NAME}"
+    s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/" --header "Content-Type: application/x-directory" < /dev/null
+    echo direct | s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/file1"
+    s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/mid/deep/" --header "Content-Type: application/x-directory" < /dev/null
+    echo nested | s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/mid/deep/file2"
+
+    ls -R "${DIR_NAME}" > /dev/null
+
+    mv "${DIR_NAME}" "${TO_DIR_NAME}"
+
+    cmp "${TO_DIR_NAME}/file1" <(echo direct)
+    cmp "${TO_DIR_NAME}/mid/deep/file2" <(echo nested)
+    if [ -e "${DIR_NAME}" ]; then
+        echo "${DIR_NAME} still exists after mv"
+        return 1
+    fi
+
+    # [NOTE]
+    # Check the objects as well as the mount point.  An object left
+    # behind under the old prefix is not necessarily visible there,
+    # because the rename removes the objects of the directories above it.
+    #
+    if s3_head "${TEST_BUCKET_1}/${OBJECT_PREFIX}/file1"; then
+        echo "${OBJECT_PREFIX}/file1 was left behind"
+        return 1
+    fi
+    if s3_head "${TEST_BUCKET_1}/${OBJECT_PREFIX}/mid/deep/file2"; then
+        echo "${OBJECT_PREFIX}/mid/deep/file2 was left behind"
+        return 1
+    fi
+
+    rm -r "${TO_DIR_NAME}"
+}
+
 function test_external_directory_creation {
     describe "Test external directory creation ..."
-    OBJECT_NAME="$(basename $PWD)/directory/${TEST_TEXT_FILE}"
-    echo "data" | aws_cli s3 cp - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/directory/"${TEST_TEXT_FILE}"
+    echo "data" | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}"
+    # shellcheck disable=SC2010
     ls | grep -q directory
+    stat directory >/dev/null 2>&1
     get_permissions directory | grep -q 750$
     ls directory
-    cmp <(echo "data") directory/${TEST_TEXT_FILE}
-    rm -f directory/${TEST_TEXT_FILE}
+    cmp <(echo "data") directory/"${TEST_TEXT_FILE}"
+    rm -f directory/"${TEST_TEXT_FILE}"
+}
+
+function test_external_no_slash_directory_object {
+    describe "Test old style directory object without trailing slash ..."
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/no_slash_dir
+    s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" --header "Content-Type: application/x-directory" < /dev/null
+    [ -d no_slash_dir ]
+    # updating metadata replaces the old style "dir" object with "dir/"
+    chmod 700 no_slash_dir
+    get_permissions no_slash_dir | grep -q 700$
+    touch no_slash_dir/"${TEST_TEXT_FILE}"
+    rm no_slash_dir/"${TEST_TEXT_FILE}"
+    rmdir no_slash_dir
+    if s3_head "${TEST_BUCKET_1}/${OBJECT_NAME}"; then
+        return 1
+    fi
+    if s3_head "${TEST_BUCKET_1}/${OBJECT_NAME}/"; then
+        return 1
+    fi
+}
+
+function test_chmod_listed_directory_keeps_metadata {
+    describe "Test chmod after listing copies the directory object ..."
+
+    # [NOTE]
+    # With nocopyapi the directory object is always recreated instead of
+    # copied, so metadata from other clients cannot be preserved.
+    #
+    if s3fs_args | grep -q nocopyapi; then
+        echo "This test does not run with nocopyapi"
+        return 0
+    fi
+
+    # [NOTE]
+    # macos fuse-t mounts over NFS and hands s3fs permission-only modes(the
+    # S_IFDIR/S_IFREG type bits are stripped), so the copied directory object
+    # carries x-amz-meta-mode 488 rather than 16872 and the assertion below
+    # cannot match.  fuse-t is also run with "noattrcache", so the kernel
+    # issues a getattr before the chmod that reloads the directory type
+    # directly from a HEAD, healing the stat cache regardless of what the
+    # listing stored.  The test therefore cannot probe the poisoned-type
+    # path on macos.
+    #
+    if [ "$(uname)" = "Darwin" ]; then
+        echo "This test does not run on macos"
+        return 0
+    fi
+
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_DIR}"/
+
+    # Create a "dir/" object externally, carrying metadata from another client.
+    # x-amz-meta-mode 16877 is 0755 with S_IFDIR.
+    s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" \
+        --header "Content-Type: application/x-directory" \
+        --header "x-amz-meta-mode: 16877" \
+        --header "x-amz-meta-foreign: keepme" < /dev/null
+
+    local HEADERS; HEADERS=$(s3_head "${TEST_BUCKET_1}/${OBJECT_NAME}")
+    if ! has_header "${HEADERS}" "x-amz-meta-foreign: keepme"; then
+        echo "The object does not have the x-amz-meta-foreign header after upload"
+        return 1
+    fi
+
+    # List the parent so that readdir fills the stat cache from the listing.
+    # shellcheck disable=SC2010
+    if ! ls | grep -q "${TEST_DIR}"; then
+        echo "Not found ${TEST_DIR} directory"
+        return 1
+    fi
+
+    # A metadata update on a directory backed by a "dir/" object must copy
+    # the object in place, which keeps metadata set by other clients and
+    # adds no metadata of its own except the changed values.  If the
+    # listing poisoned the cached directory type, s3fs instead deletes the
+    # "dir" key and recreates "dir/" from a full fresh header set.
+    if ! chmod 750 "${TEST_DIR}"; then
+        echo "Failed to set 750 permission for ${TEST_DIR} directory"
+        return 1
+    fi
+    if ! get_permissions "${TEST_DIR}" | grep -q 750$; then
+        echo "Could not get the permission for ${TEST_DIR} directory"
+        return 1
+    fi
+
+    HEADERS=$(s3_head "${TEST_BUCKET_1}/${OBJECT_NAME}")
+    # metadata from the other client survives
+    if ! has_header "${HEADERS}" "x-amz-meta-foreign: keepme"; then
+        echo "The object does not have the x-amz-meta-foreign header after permission change"
+        return 1
+    fi
+    # 16872 is 0750 with S_IFDIR
+    if ! has_header "${HEADERS}" "x-amz-meta-mode: 16872"; then
+        echo "The object does not have the \"x-amz-meta-mode: 16872\" header after permission change"
+        return 1
+    fi
+    # recreating the directory object stamps time metadata that chmod on a
+    # copied object never adds
+    if has_header "${HEADERS}" "x-amz-meta-mtime"; then
+        echo "chmod recreated the ${OBJECT_NAME} object instead of copying it" 1>&2
+        return 1
+    fi
+
+    rm_test_dir
 }
 
 function test_external_modification {
     describe "Test external modification to an object ..."
-    echo "old" > ${TEST_TEXT_FILE}
-    OBJECT_NAME="$(basename $PWD)/${TEST_TEXT_FILE}"
-    echo "new new" | aws_cli s3 cp - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
-    cmp ${TEST_TEXT_FILE} <(echo "new new")
-    rm -f ${TEST_TEXT_FILE}
+    echo "old" > "${TEST_TEXT_FILE}"
+
+    # [NOTE]
+    # If the stat and file cache directory are enabled, an error will
+    # occur if the unixtime(sec) value does not change.
+    # If mtime(ctime/atime) when updating from the external program
+    # (awscli) is the same unixtime value as immediately before, the
+    # cache will be read out.
+    # Therefore, we need to wait over 1 second here.
+    #
+    # In particular, on MacOS, getattrs may be called after a file is
+    # uploaded(released).
+    # This extends the expiration date of the target file(1 sec by
+    # stat_cache_interval_expire option).
+    # Therefore, on MacOS, you need to add an additional 1 sec.
+    # (Verified on macos/fuse-t: with use_cache and only a 1 second
+    # wait, about 1 in 3 runs still read stale data, while 2 seconds
+    # is reliable.  This is a caching effect, not NFS timestamp
+    # granularity.)
+    #
+    sleep 1
+    wait_ostype 1 "Darwin"
+
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
+    echo "new new" | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}"
+
+    cmp "${TEST_TEXT_FILE}" <(echo "new new")
+    rm -f "${TEST_TEXT_FILE}"
+}
+
+function test_external_creation {
+    describe "Test external creation of an object ..."
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
+
+    # [NOTE]
+    # If noobj_cache is enabled, register that cache here.
+    #
+    [ ! -e "${TEST_TEXT_FILE}" ]
+
+    # [NOTE]
+    # If noobj_cache is enabled, we cannot be sure that it is registered in that cache.
+    # That's because an error will occur if the upload by aws cli takes more than 1 second.
+    #
+    echo "data" | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}"
+
+    wait_ostype 1
+
+    [ -e "${TEST_TEXT_FILE}" ]
+
+    rm -f "${TEST_TEXT_FILE}"
 }
 
 function test_read_external_object() {
     describe "create objects via aws CLI and read via s3fs ..."
-    OBJECT_NAME="$(basename $PWD)/${TEST_TEXT_FILE}"
-    echo "test" | aws_cli s3 cp - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
-    cmp ${TEST_TEXT_FILE} <(echo "test")
-    rm -f ${TEST_TEXT_FILE}
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
+    echo "test" | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}"
+    cmp "${TEST_TEXT_FILE}" <(echo "test")
+    rm -f "${TEST_TEXT_FILE}"
+}
+
+function test_read_external_dir_object() {
+    describe "create directory objects via aws CLI and read via s3fs ..."
+    local SUB_DIR_NAME;      SUB_DIR_NAME="subdir"
+    local SUB_DIR_TEST_FILE; SUB_DIR_TEST_FILE="${SUB_DIR_NAME}/${TEST_TEXT_FILE}"
+    local OBJECT_NAME;       OBJECT_NAME=$(basename "${PWD}")/"${SUB_DIR_TEST_FILE}"
+
+    echo "test" | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}"
+
+    if stat "${SUB_DIR_NAME}" | grep -q '1969-12-31[[:space:]]23:59:59[.]000000000'; then
+        echo "sub directory a/c/m time is underflow(-1)."
+        return 1
+    fi
+    rm -rf "${SUB_DIR_NAME}"
 }
 
 function test_update_metadata_external_small_object() {
@@ -375,62 +794,83 @@ function test_update_metadata_external_small_object() {
     # [NOTE]
     # Use the only filename in the test to avoid being affected by noobjcache.
     #
-    TEST_FILE_EXT=`make_random_string`
-    TEST_CHMOD_FILE="${TEST_TEXT_FILE}_chmod.${TEST_FILE_EXT}"
-    TEST_CHOWN_FILE="${TEST_TEXT_FILE}_chown.${TEST_FILE_EXT}"
-    TEST_UTIMENS_FILE="${TEST_TEXT_FILE}_utimens.${TEST_FILE_EXT}"
-    TEST_SETXATTR_FILE="${TEST_TEXT_FILE}_xattr.${TEST_FILE_EXT}"
-    TEST_RMXATTR_FILE="${TEST_TEXT_FILE}_xattr.${TEST_FILE_EXT}"
+    local TEST_FILE_EXT; TEST_FILE_EXT=$(mktemp "XXXXXXXXXX")
+    local TEST_CHMOD_FILE="${TEST_TEXT_FILE}_chmod.${TEST_FILE_EXT}"
+    local TEST_CHOWN_FILE="${TEST_TEXT_FILE}_chown.${TEST_FILE_EXT}"
+    local TEST_UTIMENS_FILE="${TEST_TEXT_FILE}_utimens.${TEST_FILE_EXT}"
+    local TEST_SETXATTR_FILE="${TEST_TEXT_FILE}_set_xattr.${TEST_FILE_EXT}"
+    local TEST_RMXATTR_FILE="${TEST_TEXT_FILE}_rm_xattr.${TEST_FILE_EXT}"
 
-    TEST_INPUT="TEST_STRING_IN_SMALL_FILE"
+    local TEST_INPUT="TEST_STRING_IN_SMALL_FILE"
 
     #
     # chmod
     #
-    OBJECT_NAME="$(basename $PWD)/${TEST_CHMOD_FILE}"
-    echo "${TEST_INPUT}" | aws_cli s3 cp - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
-    chmod +x ${TEST_CHMOD_FILE}
-    cmp ${TEST_CHMOD_FILE} <(echo "${TEST_INPUT}")
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_CHMOD_FILE}"
+    echo "${TEST_INPUT}" | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}"
+    chmod +x "${TEST_CHMOD_FILE}"
+    cmp "${TEST_CHMOD_FILE}" <(echo "${TEST_INPUT}")
 
     #
     # chown
     #
-    OBJECT_NAME="$(basename $PWD)/${TEST_CHOWN_FILE}"
-    echo "${TEST_INPUT}" | aws_cli s3 cp - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
-    chown $UID ${TEST_CHOWN_FILE}
-    cmp ${TEST_CHOWN_FILE} <(echo "${TEST_INPUT}")
+    OBJECT_NAME=$(basename "${PWD}")/"${TEST_CHOWN_FILE}"
+    echo "${TEST_INPUT}" | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}"
+    chown "${UID}" "${TEST_CHOWN_FILE}"
+    cmp "${TEST_CHOWN_FILE}" <(echo "${TEST_INPUT}")
 
     #
     # utimens
     #
-    OBJECT_NAME="$(basename $PWD)/${TEST_UTIMENS_FILE}"
-    echo "${TEST_INPUT}" | aws_cli s3 cp - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
-    touch ${TEST_UTIMENS_FILE}
-    cmp ${TEST_UTIMENS_FILE} <(echo "${TEST_INPUT}")
+    OBJECT_NAME=$(basename "${PWD}")/"${TEST_UTIMENS_FILE}"
+    echo "${TEST_INPUT}" | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}"
+    touch "${TEST_UTIMENS_FILE}"
+    cmp "${TEST_UTIMENS_FILE}" <(echo "${TEST_INPUT}")
 
     #
     # set xattr
     #
-    OBJECT_NAME="$(basename $PWD)/${TEST_SETXATTR_FILE}"
-    echo "${TEST_INPUT}" | aws_cli s3 cp - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
-    set_xattr key value ${TEST_SETXATTR_FILE}
-    cmp ${TEST_SETXATTR_FILE} <(echo "${TEST_INPUT}")
+    OBJECT_NAME=$(basename "${PWD}")/"${TEST_SETXATTR_FILE}"
+    echo "${TEST_INPUT}" | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}"
+    set_xattr key value "${TEST_SETXATTR_FILE}"
+    cmp "${TEST_SETXATTR_FILE}" <(echo "${TEST_INPUT}")
+    XATTR_VALUE=$(get_xattr key "${TEST_SETXATTR_FILE}")
+    if [ -z "${XATTR_VALUE}" ] || [ "${XATTR_VALUE}" != "value" ]; then
+        echo "could not read xattr(key) value."
+        return 1
+    fi
 
     #
     # remove xattr
     #
     # "%7B%22key%22%3A%22dmFsdWU%3D%22%7D" = {"key":"value"}
     #
-    OBJECT_NAME="$(basename $PWD)/${TEST_RMXATTR_FILE}"
-    echo "${TEST_INPUT}" | aws_cli s3 cp - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}" --metadata xattr=%7B%22key%22%3A%22dmFsdWU%3D%22%7D
-    del_xattr key ${TEST_RMXATTR_FILE}
-    cmp ${TEST_RMXATTR_FILE} <(echo "${TEST_INPUT}")
+    # [FIXME]
+    # For macos, the xattrs value specified with the "--metadata" option cannot
+    # be set on the object. We confirmed this with the following versions:
+    #     aws-cli/2.27.35 Python/3.13.3 Darwin/22.6.0 exe/x86_64
+    # We also tried to run "aws s3api put-object", but the result was the same.
+    #
+    # Since xattrs cannot be set on objects uploaded with the aws command, this
+    # will be skipped for macos.
+    # If a solution is found in the future, we will test it on macos as well.
+    #
+    if ! uname | grep -q Darwin; then
+        OBJECT_NAME=$(basename "${PWD}")/"${TEST_RMXATTR_FILE}"
+        echo "${TEST_INPUT}" | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" --header "x-amz-meta-xattr: %7B%22key%22%3A%22dmFsdWU%3D%22%7D"
+        del_xattr key "${TEST_RMXATTR_FILE}"
+        cmp "${TEST_RMXATTR_FILE}" <(echo "${TEST_INPUT}")
+        if find_xattr key "${TEST_RMXATTR_FILE}"; then
+            echo "could read xattr(key) value after removing it."
+            return 1
+        fi
+    fi
 
-    rm -f ${TEST_CHMOD_FILE}
-    rm -f ${TEST_CHOWN_FILE}
-    rm -f ${TEST_UTIMENS_FILE}
-    rm -f ${TEST_SETXATTR_FILE}
-    rm -f ${TEST_RMXATTR_FILE}
+    rm -f "${TEST_CHMOD_FILE}"
+    rm -f "${TEST_CHOWN_FILE}"
+    rm -f "${TEST_UTIMENS_FILE}"
+    rm -f "${TEST_SETXATTR_FILE}"
+    rm -f "${TEST_RMXATTR_FILE}"
 }
 
 function test_update_metadata_external_large_object() {
@@ -439,86 +879,109 @@ function test_update_metadata_external_large_object() {
     # [NOTE]
     # Use the only filename in the test to avoid being affected by noobjcache.
     #
-    TEST_FILE_EXT=`make_random_string`
-    TEST_CHMOD_FILE="${TEST_TEXT_FILE}_chmod.${TEST_FILE_EXT}"
-    TEST_CHOWN_FILE="${TEST_TEXT_FILE}_chown.${TEST_FILE_EXT}"
-    TEST_UTIMENS_FILE="${TEST_TEXT_FILE}_utimens.${TEST_FILE_EXT}"
-    TEST_SETXATTR_FILE="${TEST_TEXT_FILE}_xattr.${TEST_FILE_EXT}"
-    TEST_RMXATTR_FILE="${TEST_TEXT_FILE}_xattr.${TEST_FILE_EXT}"
+    local TEST_FILE_EXT; TEST_FILE_EXT=$(mktemp "XXXXXXXXXX")
+    local TEST_CHMOD_FILE="${TEST_TEXT_FILE}_chmod.${TEST_FILE_EXT}"
+    local TEST_CHOWN_FILE="${TEST_TEXT_FILE}_chown.${TEST_FILE_EXT}"
+    local TEST_UTIMENS_FILE="${TEST_TEXT_FILE}_utimens.${TEST_FILE_EXT}"
+    local TEST_SETXATTR_FILE="${TEST_TEXT_FILE}_set_xattr.${TEST_FILE_EXT}"
+    local TEST_RMXATTR_FILE="${TEST_TEXT_FILE}_rm_xattr.${TEST_FILE_EXT}"
 
-    ../../junk_data $(($BIG_FILE_BLOCK_SIZE * $BIG_FILE_COUNT)) > "${TEMP_DIR}/${BIG_FILE}"
+    ../../junk_data $((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT)) > "${TEMP_DIR}/${BIG_FILE}"
 
     #
     # chmod
     #
-    OBJECT_NAME="$(basename $PWD)/${TEST_CHMOD_FILE}"
-    aws_cli s3 cp ${TEMP_DIR}/${BIG_FILE} "s3://${TEST_BUCKET_1}/${OBJECT_NAME}" --no-progress
-    chmod +x ${TEST_CHMOD_FILE}
-    cmp ${TEST_CHMOD_FILE} ${TEMP_DIR}/${BIG_FILE}
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_CHMOD_FILE}"
+    s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" < "${TEMP_DIR}/${BIG_FILE}"
+    chmod +x "${TEST_CHMOD_FILE}"
+    cmp "${TEST_CHMOD_FILE}" "${TEMP_DIR}/${BIG_FILE}"
 
     #
     # chown
     #
-    OBJECT_NAME="$(basename $PWD)/${TEST_CHOWN_FILE}"
-    aws_cli s3 cp ${TEMP_DIR}/${BIG_FILE} "s3://${TEST_BUCKET_1}/${OBJECT_NAME}" --no-progress
-    chown $UID ${TEST_CHOWN_FILE}
-    cmp ${TEST_CHOWN_FILE} ${TEMP_DIR}/${BIG_FILE}
+    OBJECT_NAME=$(basename "${PWD}")/"${TEST_CHOWN_FILE}"
+    s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" < "${TEMP_DIR}/${BIG_FILE}"
+    chown "${UID}" "${TEST_CHOWN_FILE}"
+    cmp "${TEST_CHOWN_FILE}" "${TEMP_DIR}/${BIG_FILE}"
 
     #
     # utimens
     #
-    OBJECT_NAME="$(basename $PWD)/${TEST_UTIMENS_FILE}"
-    aws_cli s3 cp ${TEMP_DIR}/${BIG_FILE} "s3://${TEST_BUCKET_1}/${OBJECT_NAME}" --no-progress
-    touch ${TEST_UTIMENS_FILE}
-    cmp ${TEST_UTIMENS_FILE} ${TEMP_DIR}/${BIG_FILE}
+    OBJECT_NAME=$(basename "${PWD}")/"${TEST_UTIMENS_FILE}"
+    s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" < "${TEMP_DIR}/${BIG_FILE}"
+    touch "${TEST_UTIMENS_FILE}"
+    cmp "${TEST_UTIMENS_FILE}" "${TEMP_DIR}/${BIG_FILE}"
 
     #
     # set xattr
     #
-    OBJECT_NAME="$(basename $PWD)/${TEST_SETXATTR_FILE}"
-    aws_cli s3 cp ${TEMP_DIR}/${BIG_FILE} "s3://${TEST_BUCKET_1}/${OBJECT_NAME}" --no-progress
-    set_xattr key value ${TEST_SETXATTR_FILE}
-    cmp ${TEST_SETXATTR_FILE} ${TEMP_DIR}/${BIG_FILE}
+    OBJECT_NAME=$(basename "${PWD}")/"${TEST_SETXATTR_FILE}"
+    s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" < "${TEMP_DIR}/${BIG_FILE}"
+    set_xattr key value "${TEST_SETXATTR_FILE}"
+    cmp "${TEST_SETXATTR_FILE}" "${TEMP_DIR}/${BIG_FILE}"
+    XATTR_VALUE=$(get_xattr key "${TEST_SETXATTR_FILE}")
+    if [ -z "${XATTR_VALUE}" ] || [ "${XATTR_VALUE}" != "value" ]; then
+        echo "could not read xattr(key) value."
+        return 1
+    fi
 
     #
     # remove xattr
     #
     # "%7B%22key%22%3A%22dmFsdWU%3D%22%7D" = {"key":"value"}
     #
-    OBJECT_NAME="$(basename $PWD)/${TEST_RMXATTR_FILE}"
-    aws_cli s3 cp ${TEMP_DIR}/${BIG_FILE} "s3://${TEST_BUCKET_1}/${OBJECT_NAME}" --no-progress --metadata xattr=%7B%22key%22%3A%22dmFsdWU%3D%22%7D
-    del_xattr key ${TEST_RMXATTR_FILE}
-    cmp ${TEST_RMXATTR_FILE} ${TEMP_DIR}/${BIG_FILE}
+    # [FIXME]
+    # For macos, the xattrs value specified with the "--metadata" option cannot
+    # be set on the object. We confirmed this with the following versions:
+    #     aws-cli/2.27.35 Python/3.13.3 Darwin/22.6.0 exe/x86_64
+    # We also tried to run "aws s3api put-object", but the result was the same.
+    #
+    # Since xattrs cannot be set on objects uploaded with the aws command, this
+    # will be skipped for macos.
+    # If a solution is found in the future, we will test it on macos as well.
+    #
+    if ! uname | grep -q Darwin; then
+        OBJECT_NAME=$(basename "${PWD}")/"${TEST_RMXATTR_FILE}"
+        s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" --header "x-amz-meta-xattr: %7B%22key%22%3A%22dmFsdWU%3D%22%7D" < "${TEMP_DIR}/${BIG_FILE}"
+        del_xattr key "${TEST_RMXATTR_FILE}"
+        cmp "${TEST_RMXATTR_FILE}" "${TEMP_DIR}/${BIG_FILE}"
+        if find_xattr key "${TEST_RMXATTR_FILE}"; then
+            echo "could read xattr(key) value after removing it."
+            return 1
+        fi
+    fi
 
-    rm -f ${TEMP_DIR}/${BIG_FILE}
-    rm -f ${TEST_CHMOD_FILE}
-    rm -f ${TEST_CHOWN_FILE}
-    rm -f ${TEST_UTIMENS_FILE}
-    rm -f ${TEST_SETXATTR_FILE}
-    rm -f ${TEST_RMXATTR_FILE}
+    rm -f "${TEMP_DIR}/${BIG_FILE}"
+    rm -f "${TEST_CHMOD_FILE}"
+    rm -f "${TEST_CHOWN_FILE}"
+    rm -f "${TEST_UTIMENS_FILE}"
+    rm -f "${TEST_SETXATTR_FILE}"
+    rm -f "${TEST_RMXATTR_FILE}"
 }
 
 function test_rename_before_close {
     describe "Testing rename before close ..."
+
+    # shellcheck disable=SC2094
     (
         echo foo
-        mv $TEST_TEXT_FILE ${TEST_TEXT_FILE}.new
-    ) > $TEST_TEXT_FILE
+        mv "${TEST_TEXT_FILE}" "${TEST_TEXT_FILE}.new"
+    ) > "${TEST_TEXT_FILE}"
 
-    if ! cmp <(echo foo) ${TEST_TEXT_FILE}.new; then
+    if ! cmp <(echo "foo") "${TEST_TEXT_FILE}.new"; then
         echo "rename before close failed"
         return 1
     fi
 
-    rm_test_file ${TEST_TEXT_FILE}.new
-    rm -f ${TEST_TEXT_FILE}
+    rm_test_file "${TEST_TEXT_FILE}.new"
+    rm -f "${TEST_TEXT_FILE}"
 }
 
 function test_multipart_upload {
     describe "Testing multi-part upload ..."
 
-    ../../junk_data $(($BIG_FILE_BLOCK_SIZE * $BIG_FILE_COUNT)) > "${TEMP_DIR}/${BIG_FILE}"
-    dd if="${TEMP_DIR}/${BIG_FILE}" of="${BIG_FILE}" bs=$BIG_FILE_BLOCK_SIZE count=$BIG_FILE_COUNT
+    ../../junk_data $((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT)) > "${TEMP_DIR}/${BIG_FILE}"
+    dd if="${TEMP_DIR}/${BIG_FILE}" of="${BIG_FILE}" bs="${BIG_FILE_BLOCK_SIZE}" count="${BIG_FILE_COUNT}"
 
     # Verify contents of file
     echo "Comparing test file"
@@ -534,8 +997,8 @@ function test_multipart_upload {
 function test_multipart_copy {
     describe "Testing multi-part copy ..."
 
-    ../../junk_data $(($BIG_FILE_BLOCK_SIZE * $BIG_FILE_COUNT)) > "${TEMP_DIR}/${BIG_FILE}"
-    dd if="${TEMP_DIR}/${BIG_FILE}" of="${BIG_FILE}" bs=$BIG_FILE_BLOCK_SIZE count=$BIG_FILE_COUNT
+    ../../junk_data $((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT)) > "${TEMP_DIR}/${BIG_FILE}"
+    dd if="${TEMP_DIR}/${BIG_FILE}" of="${BIG_FILE}" bs="${BIG_FILE_BLOCK_SIZE}" count="${BIG_FILE_COUNT}"
     mv "${BIG_FILE}" "${BIG_FILE}-copy"
 
     # Verify contents of file
@@ -552,26 +1015,49 @@ function test_multipart_copy {
     rm_test_file "${BIG_FILE}-copy"
 }
 
+function test_multipart_copy_chmod {
+    describe "Testing chmod with multi-part copy ..."
+
+    # BIG_FILE_LENGTH(25MB) >= multipart_threshold(25MB), so updating the
+    # metadata goes through put_headers() -> multipart_put_head_request(),
+    # and with multipart_copy_size=10 the server-side copy uses 3 parts.
+    ../../junk_data $((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT)) > "${TEMP_DIR}/${BIG_FILE}"
+    dd if="${TEMP_DIR}/${BIG_FILE}" of="${BIG_FILE}" bs="${BIG_FILE_BLOCK_SIZE}" count="${BIG_FILE_COUNT}"
+
+    chmod 613 "${BIG_FILE}"
+
+    local permissions; permissions=$(get_permissions "${BIG_FILE}")
+    if [ "${permissions}" != "613" ]; then
+        echo "chmod expected 613, got ${permissions}"
+        return 1
+    fi
+
+    # Verify the copy did not corrupt the contents
+    if ! cmp "${TEMP_DIR}/${BIG_FILE}" "${BIG_FILE}"; then
+        return 1
+    fi
+
+    rm -f "${TEMP_DIR}/${BIG_FILE}"
+    rm_test_file "${BIG_FILE}"
+}
+
 function test_multipart_mix {
     describe "Testing multi-part mix ..."
 
-    if [ `uname` = "Darwin" ]; then
-       cat /dev/null > $BIG_FILE
-    fi
-    ../../junk_data $(($BIG_FILE_BLOCK_SIZE * $BIG_FILE_COUNT)) > "${TEMP_DIR}/${BIG_FILE}"
-    dd if="${TEMP_DIR}/${BIG_FILE}" of="${BIG_FILE}" bs=$BIG_FILE_BLOCK_SIZE count=$BIG_FILE_COUNT
+    ../../junk_data $((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT)) > "${TEMP_DIR}/${BIG_FILE}"
+    dd if="${TEMP_DIR}/${BIG_FILE}" of="${BIG_FILE}" bs="${BIG_FILE_BLOCK_SIZE}" count="${BIG_FILE_COUNT}"
 
     # (1) Edit the middle of an existing file
     #     modify directly(seek 7.5MB offset)
     #     In the case of nomultipart and nocopyapi,
     #     it makes no sense, but copying files is because it leaves no cache.
     #
-    cp ${TEMP_DIR}/${BIG_FILE} ${TEMP_DIR}/${BIG_FILE}-mix
-    cp ${BIG_FILE} ${BIG_FILE}-mix
+    cp "${TEMP_DIR}/${BIG_FILE}" "${TEMP_DIR}/${BIG_FILE}-mix"
+    cp_avoid_xattr_err "${BIG_FILE}" "${BIG_FILE}-mix"
 
-    MODIFY_START_BLOCK=$((15*1024*1024/2/4))
-    echo -n "0123456789ABCDEF" | dd of="${BIG_FILE}-mix" bs=4 count=4 seek=$MODIFY_START_BLOCK conv=notrunc
-    echo -n "0123456789ABCDEF" | dd of="${TEMP_DIR}/${BIG_FILE}-mix" bs=4 count=4 seek=$MODIFY_START_BLOCK conv=notrunc
+    local MODIFY_START_BLOCK=$((15*1024*1024/2/4))
+    echo -n "0123456789ABCDEF" | dd of="${BIG_FILE}-mix" bs=4 count=4 seek="${MODIFY_START_BLOCK}" conv=notrunc
+    echo -n "0123456789ABCDEF" | dd of="${TEMP_DIR}/${BIG_FILE}-mix" bs=4 count=4 seek="${MODIFY_START_BLOCK}" conv=notrunc
 
     # Verify contents of file
     echo "Comparing test file (1)"
@@ -583,12 +1069,12 @@ function test_multipart_mix {
     # (2) Write to an area larger than the size of the existing file
     #     modify directly(over file end offset)
     #
-    cp ${TEMP_DIR}/${BIG_FILE} ${TEMP_DIR}/${BIG_FILE}-mix
-    cp ${BIG_FILE} ${BIG_FILE}-mix
+    cp "${TEMP_DIR}/${BIG_FILE}" "${TEMP_DIR}/${BIG_FILE}-mix"
+    cp_avoid_xattr_err "${BIG_FILE}" "${BIG_FILE}-mix"
 
-    OVER_FILE_BLOCK_POS=$((26*1024*1024/4))
-    echo -n "0123456789ABCDEF" | dd of="${BIG_FILE}-mix" bs=4 count=4 seek=$OVER_FILE_BLOCK_POS conv=notrunc
-    echo -n "0123456789ABCDEF" | dd of="${TEMP_DIR}/${BIG_FILE}-mix" bs=4 count=4 seek=$OVER_FILE_BLOCK_POS conv=notrunc
+    local OVER_FILE_BLOCK_POS=$((26*1024*1024/4))
+    echo -n "0123456789ABCDEF" | dd of="${BIG_FILE}-mix" bs=4 count=4 seek="${OVER_FILE_BLOCK_POS}" conv=notrunc
+    echo -n "0123456789ABCDEF" | dd of="${TEMP_DIR}/${BIG_FILE}-mix" bs=4 count=4 seek="${OVER_FILE_BLOCK_POS}" conv=notrunc
 
     # Verify contents of file
     echo "Comparing test file (2)"
@@ -599,8 +1085,8 @@ function test_multipart_mix {
 
     # (3) Writing from the 0th byte
     #
-    cp ${TEMP_DIR}/${BIG_FILE} ${TEMP_DIR}/${BIG_FILE}-mix
-    cp ${BIG_FILE} ${BIG_FILE}-mix
+    cp "${TEMP_DIR}/${BIG_FILE}" "${TEMP_DIR}/${BIG_FILE}-mix"
+    cp_avoid_xattr_err "${BIG_FILE}" "${BIG_FILE}-mix"
 
     echo -n "0123456789ABCDEF" | dd of="${BIG_FILE}-mix" bs=4 count=4 seek=0 conv=notrunc
     echo -n "0123456789ABCDEF" | dd of="${TEMP_DIR}/${BIG_FILE}-mix" bs=4 count=4 seek=0 conv=notrunc
@@ -615,12 +1101,12 @@ function test_multipart_mix {
     # (4) Write to the area within 5MB from the top
     #     modify directly(seek 1MB offset)
     #
-    cp ${TEMP_DIR}/${BIG_FILE} ${TEMP_DIR}/${BIG_FILE}-mix
-    cp ${BIG_FILE} ${BIG_FILE}-mix
+    cp "${TEMP_DIR}/${BIG_FILE}" "${TEMP_DIR}/${BIG_FILE}-mix"
+    cp_avoid_xattr_err "${BIG_FILE}" "${BIG_FILE}-mix"
 
-    MODIFY_START_BLOCK=$((1*1024*1024))
-    echo -n "0123456789ABCDEF" | dd of="${BIG_FILE}-mix" bs=4 count=4 seek=$MODIFY_START_BLOCK conv=notrunc
-    echo -n "0123456789ABCDEF" | dd of="${TEMP_DIR}/${BIG_FILE}-mix" bs=4 count=4 seek=$MODIFY_START_BLOCK conv=notrunc
+    local MODIFY_START_BLOCK=$((1*1024*1024))
+    echo -n "0123456789ABCDEF" | dd of="${BIG_FILE}-mix" bs=4 count=4 seek="${MODIFY_START_BLOCK}" conv=notrunc
+    echo -n "0123456789ABCDEF" | dd of="${TEMP_DIR}/${BIG_FILE}-mix" bs=4 count=4 seek="${MODIFY_START_BLOCK}" conv=notrunc
 
     # Verify contents of file
     echo "Comparing test file (4)"
@@ -629,21 +1115,59 @@ function test_multipart_mix {
        return 1
     fi
 
+    # [NOTE]
+    # For macos, in order to free up disk space for statvfs (or df command),
+    # it is necessary to zero out the file size, delete it, and sync it.
+    # In the case of macos, even if you delete a file, there seems to be a
+    # delay in the free space being reflected.
+    # Testing the ensure_diskfree option shows that if this is not done, free
+    # disk space will be exhausted.
+    #
+    if [ "$(uname)" = "Darwin" ]; then
+        cat /dev/null > "${TEMP_DIR}/${BIG_FILE}"
+        cat /dev/null > "${TEMP_DIR}/${BIG_FILE}-mix"
+        cat /dev/null > "${BIG_FILE}"
+        cat /dev/null > "${BIG_FILE}-mix"
+    fi
+
     rm -f "${TEMP_DIR}/${BIG_FILE}"
     rm -f "${TEMP_DIR}/${BIG_FILE}-mix"
     rm_test_file "${BIG_FILE}"
     rm_test_file "${BIG_FILE}-mix"
+
+    if [ "$(uname)" = "Darwin" ]; then
+        sync
+    fi
+}
+
+function test_max_dirty_data_flush {
+    describe "Testing mid-write flush by max_dirty_data ..."
+
+    local MAX_DIRTY_DATA_FILE="max-dirty-data-test.bin"
+
+    # Writing 64MB crosses max_dirty_data=50, forcing a flush while the file
+    # is still open for writing; the final flush at close then combines
+    # copying the already-uploaded head with uploading the modified tail.
+    ../../junk_data $((64 * 1024 * 1024)) > "${TEMP_DIR}/${MAX_DIRTY_DATA_FILE}"
+    cp "${TEMP_DIR}/${MAX_DIRTY_DATA_FILE}" "${MAX_DIRTY_DATA_FILE}"
+
+    if ! cmp "${TEMP_DIR}/${MAX_DIRTY_DATA_FILE}" "${MAX_DIRTY_DATA_FILE}"; then
+        return 1
+    fi
+
+    rm -f "${TEMP_DIR}/${MAX_DIRTY_DATA_FILE}"
+    rm_test_file "${MAX_DIRTY_DATA_FILE}"
 }
 
 function test_utimens_during_multipart {
     describe "Testing utimens calling during multipart copy ..."
 
-    ../../junk_data $(($BIG_FILE_BLOCK_SIZE * $BIG_FILE_COUNT)) > "${TEMP_DIR}/${BIG_FILE}"
+    ../../junk_data $((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT)) > "${TEMP_DIR}/${BIG_FILE}"
 
-    cp ${TEMP_DIR}/${BIG_FILE} ${BIG_FILE}
+    cp "${TEMP_DIR}/${BIG_FILE}" "${BIG_FILE}"
 
     # The second copy of the "-p" option calls utimens during multipart upload.
-    cp -p ${TEMP_DIR}/${BIG_FILE} ${BIG_FILE}
+    cp -p "${TEMP_DIR}/${BIG_FILE}" "${BIG_FILE}"
 
     rm -f "${TEMP_DIR}/${BIG_FILE}"
     rm_test_file "${BIG_FILE}"
@@ -654,11 +1178,16 @@ function test_special_characters {
 
     (
         set +o pipefail
+        # shellcheck disable=SC2010
         ls 'special' 2>&1 | grep -q 'No such file or directory'
+        # shellcheck disable=SC2010
         ls 'special?' 2>&1 | grep -q 'No such file or directory'
+        # shellcheck disable=SC2010
         ls 'special*' 2>&1 | grep -q 'No such file or directory'
+        # shellcheck disable=SC2010
         ls 'special~' 2>&1 | grep -q 'No such file or directory'
-        ls 'specialµ' 2>&1 | grep -q 'No such file or directory'
+        # shellcheck disable=SC2010
+        ls 'specialμ' 2>&1 | grep -q 'No such file or directory'
     )
 
     mkdir "TOYOTA TRUCK 8.2.2"
@@ -668,56 +1197,73 @@ function test_special_characters {
 function test_hardlink {
     describe "Testing hardlinks ..."
 
-    rm -f $TEST_TEXT_FILE
-    rm -f $ALT_TEST_TEXT_FILE
-    echo foo > $TEST_TEXT_FILE
+    rm -f "${TEST_TEXT_FILE}"
+    rm -f "${ALT_TEST_TEXT_FILE}"
+    echo foo > "${TEST_TEXT_FILE}"
 
     (
+        # [NOTE]
+        # macos-fuse-t returns 'Input/output error'
+        #
         set +o pipefail
-        ln $TEST_TEXT_FILE $ALT_TEST_TEXT_FILE 2>&1 | grep -q 'Operation not supported'
+        ln "${TEST_TEXT_FILE}" "${ALT_TEST_TEXT_FILE}" 2>&1 | grep -q -e 'Operation not supported' -e 'Not supported' -e 'Input/output error'
     )
 
     rm_test_file
-    rm_test_file $ALT_TEST_TEXT_FILE
+    rm_test_file "${ALT_TEST_TEXT_FILE}"
+}
+
+function test_mknod {
+    describe "Testing mknod system call function ..."
+
+    local MKNOD_TEST_FILE_BASENAME="mknod_testfile"
+
+    rm -f "${MKNOD_TEST_FILE_BASENAME}*"
+
+    ../../mknod_test "${MKNOD_TEST_FILE_BASENAME}"
 }
 
 function test_symlink {
     describe "Testing symlinks ..."
 
-    rm -f $TEST_TEXT_FILE
-    rm -f $ALT_TEST_TEXT_FILE
-    echo foo > $TEST_TEXT_FILE
+    rm -f "${TEST_TEXT_FILE}"
+    rm -f "${ALT_TEST_TEXT_FILE}"
+    echo foo > "${TEST_TEXT_FILE}"
 
-    ln -s $TEST_TEXT_FILE $ALT_TEST_TEXT_FILE
-    cmp $TEST_TEXT_FILE $ALT_TEST_TEXT_FILE
+    ln -s "${TEST_TEXT_FILE}" "${ALT_TEST_TEXT_FILE}"
+    cmp "${TEST_TEXT_FILE}" "${ALT_TEST_TEXT_FILE}"
 
-    rm -f $TEST_TEXT_FILE
+    rm -f "${TEST_TEXT_FILE}"
 
-    [ -L $ALT_TEST_TEXT_FILE ]
-    [ ! -f $ALT_TEST_TEXT_FILE ]
+    [ -L "${ALT_TEST_TEXT_FILE}" ]
+    [ ! -f "${ALT_TEST_TEXT_FILE}" ]
 
-    rm -f $ALT_TEST_TEXT_FILE
+    rm -f "${ALT_TEST_TEXT_FILE}"
 }
 
 function test_extended_attributes {
     describe "Testing extended attributes ..."
 
-    rm -f $TEST_TEXT_FILE
-    touch $TEST_TEXT_FILE
+    rm -f "${TEST_TEXT_FILE}"
+    touch "${TEST_TEXT_FILE}"
 
     # set value
-    set_xattr key1 value1 $TEST_TEXT_FILE
-    get_xattr key1 $TEST_TEXT_FILE | grep -q '^value1$'
+    set_xattr key1 value0 "${TEST_TEXT_FILE}"
+    get_xattr key1 "${TEST_TEXT_FILE}" | grep -q '^value0$'
+
+    # over write value
+    set_xattr key1 value1 "${TEST_TEXT_FILE}"
+    get_xattr key1 "${TEST_TEXT_FILE}" | grep -q '^value1$'
 
     # append value
-    set_xattr key2 value2 $TEST_TEXT_FILE
-    get_xattr key1 $TEST_TEXT_FILE | grep -q '^value1$'
-    get_xattr key2 $TEST_TEXT_FILE | grep -q '^value2$'
+    set_xattr key2 value2 "${TEST_TEXT_FILE}"
+    get_xattr key1 "${TEST_TEXT_FILE}" | grep -q '^value1$'
+    get_xattr key2 "${TEST_TEXT_FILE}" | grep -q '^value2$'
 
     # remove value
-    del_xattr key1 $TEST_TEXT_FILE
-    ! get_xattr key1 $TEST_TEXT_FILE
-    get_xattr key2 $TEST_TEXT_FILE | grep -q '^value2$'
+    del_xattr key1 "${TEST_TEXT_FILE}"
+    get_xattr key1 "${TEST_TEXT_FILE}" && return 1
+    get_xattr key2 "${TEST_TEXT_FILE}" | grep -q '^value2$'
 
     rm_test_file
 }
@@ -726,12 +1272,12 @@ function test_mtime_file {
     describe "Testing mtime preservation function ..."
 
     # if the rename file exists, delete it
-    if [ -e $ALT_TEST_TEXT_FILE -o -L $ALT_TEST_TEXT_FILE ]
+    if [ -e "${ALT_TEST_TEXT_FILE}" ] || [ -L "${ALT_TEST_TEXT_FILE}" ]
     then
-       rm $ALT_TEST_TEXT_FILE
+       rm "${ALT_TEST_TEXT_FILE}"
     fi
 
-    if [ -e $ALT_TEST_TEXT_FILE ]
+    if [ -e "${ALT_TEST_TEXT_FILE}" ]
     then
        echo "Could not delete file ${ALT_TEST_TEXT_FILE}, it still exists"
        return 1
@@ -739,20 +1285,23 @@ function test_mtime_file {
 
     # create the test file again
     mk_test_file
-    sleep 1 # allow for some time to pass to compare the timestamps between test & alt
 
     #copy the test file with preserve mode
-    cp -p $TEST_TEXT_FILE $ALT_TEST_TEXT_FILE
-    testmtime=`get_mtime $TEST_TEXT_FILE`
-    altmtime=`get_mtime $ALT_TEST_TEXT_FILE`
-    if [ "$testmtime" -ne "$altmtime" ]
-    then
-       echo "File times do not match:  $testmtime != $altmtime"
-       return 1
+    cp_avoid_xattr_err -p "${TEST_TEXT_FILE}" "${ALT_TEST_TEXT_FILE}"
+
+    local testmtime; testmtime=$(get_mtime "${TEST_TEXT_FILE}")
+    local testctime; testctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local testatime; testatime=$(get_atime "${TEST_TEXT_FILE}")
+    local altmtime;  altmtime=$(get_mtime "${ALT_TEST_TEXT_FILE}")
+    local altctime;  altctime=$(get_ctime "${ALT_TEST_TEXT_FILE}")
+    local altatime;  altatime=$(get_atime "${ALT_TEST_TEXT_FILE}")
+
+    if [ "${testmtime}" != "${altmtime}" ] || [ "${testctime}" = "${altctime}" ] || [ "${testatime}" != "${altatime}" ]; then
+       echo "cp(-p) expected times: mtime( ${testmtime} == ${altmtime} ), ctime( ${testctime} != ${altctime} ), atime( ${testatime} == ${altatime} )"
     fi
 
     rm_test_file
-    rm_test_file $ALT_TEST_TEXT_FILE
+    rm_test_file "${ALT_TEST_TEXT_FILE}"
 }
 
 # [NOTE]
@@ -774,21 +1323,21 @@ function test_mtime_file {
 function test_update_time_chmod() {
     describe "Testing update time function chmod..."
 
-    t0=1000000000  # 9 September 2001
-    OBJECT_NAME="$(basename $PWD)/${TEST_TEXT_FILE}"
-    echo data | aws_cli s3 cp --metadata="atime=$t0,ctime=$t0,mtime=$t0" - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
-    base_atime=`get_atime $TEST_TEXT_FILE`
-    base_ctime=`get_ctime $TEST_TEXT_FILE`
-    base_mtime=`get_mtime $TEST_TEXT_FILE`
+    local t0=1000000000  # 9 September 2001
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
+    echo data | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}"
+    local base_atime; base_atime=$(get_atime "${TEST_TEXT_FILE}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_TEXT_FILE}")
 
     #
     # chmod -> update only ctime
     #
-    chmod +x $TEST_TEXT_FILE
-    atime=`get_atime $TEST_TEXT_FILE`
-    ctime=`get_ctime $TEST_TEXT_FILE`
-    mtime=`get_mtime $TEST_TEXT_FILE`
-    if [ $base_atime -ne $atime -o $base_ctime -eq $ctime -o $base_mtime -ne $mtime ]; then
+    chmod +x "${TEST_TEXT_FILE}"
+    local atime; atime=$(get_atime "${TEST_TEXT_FILE}")
+    local ctime; ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local mtime; mtime=$(get_mtime "${TEST_TEXT_FILE}")
+    if [ "${base_atime}" != "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" != "${mtime}" ]; then
        echo "chmod expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
        return 1
     fi
@@ -801,20 +1350,42 @@ function test_update_time_chown() {
     #
     # chown -> update only ctime
     #
-    t0=1000000000  # 9 September 2001
-    OBJECT_NAME="$(basename $PWD)/${TEST_TEXT_FILE}"
-    echo data | aws_cli s3 cp --metadata="atime=$t0,ctime=$t0,mtime=$t0" - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
-    base_atime=`get_atime $TEST_TEXT_FILE`
-    base_ctime=`get_ctime $TEST_TEXT_FILE`
-    base_mtime=`get_mtime $TEST_TEXT_FILE`
+    local t0=1000000000  # 9 September 2001
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
+    echo data | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}"
+    local base_atime; base_atime=$(get_atime "${TEST_TEXT_FILE}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_TEXT_FILE}")
 
-    chown $UID $TEST_TEXT_FILE
-    atime=`get_atime $TEST_TEXT_FILE`
-    ctime=`get_ctime $TEST_TEXT_FILE`
-    mtime=`get_mtime $TEST_TEXT_FILE`
-    if [ $base_atime -ne $atime -o $base_ctime -eq $ctime -o $base_mtime -ne $mtime ]; then
-       echo "chown expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
-       return 1
+    # [NOTE]
+    # In this test, chown is called with the same UID.
+    #
+    chown "${UID}" "${TEST_TEXT_FILE}"
+
+    local atime; atime=$(get_atime "${TEST_TEXT_FILE}")
+    local ctime; ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local mtime; mtime=$(get_mtime "${TEST_TEXT_FILE}")
+
+    if ! uname | grep -q Darwin; then
+        if [ "${base_atime}" != "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" != "${mtime}" ]; then
+            echo "chown expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
+            return 1
+        fi
+    else
+        # [FIXME] macos fuse-t
+        # macos fuse-t doesn't update stat if UID doesn't change.
+        # There is a way to specify "uid=1000" with aws cli and use sudo when chown is executed, but the
+        # test is not finished.
+        # For now, we are just leaving the chown call with the same UID as the parameter.
+        # This test will be fixed in the future.
+        if [ "${base_atime}" = "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" = "${mtime}" ]; then
+            if [ "${base_atime}" = "${atime}" ] && [ "${base_ctime}" = "${ctime}" ] && [ "${base_mtime}" = "${mtime}" ]; then
+                echo "[FIXME] Doing a temporary test bypass : same ctime $base_ctime = $ctime and same mtime: $base_mtime = $mtime and same atime: $base_atime = $atime"
+            else
+                echo "chown expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime != $mtime, atime: $base_atime != $atime"
+                return 1
+            fi
+        fi
     fi
     rm_test_file
 }
@@ -822,46 +1393,87 @@ function test_update_time_chown() {
 function test_update_time_xattr() {
     describe "Testing update time function set_xattr..."
 
-    t0=1000000000  # 9 September 2001
-    OBJECT_NAME="$(basename $PWD)/${TEST_TEXT_FILE}"
-    echo data | aws_cli s3 cp --metadata="atime=$t0,ctime=$t0,mtime=$t0" - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
-    base_atime=`get_atime $TEST_TEXT_FILE`
-    base_ctime=`get_ctime $TEST_TEXT_FILE`
-    base_mtime=`get_mtime $TEST_TEXT_FILE`
+    local t0=1000000000  # 9 September 2001
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
+    echo data | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}"
+    local base_atime; base_atime=$(get_atime "${TEST_TEXT_FILE}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_TEXT_FILE}")
 
     #
     # set_xattr -> update only ctime
     #
-    set_xattr key value $TEST_TEXT_FILE
-    atime=`get_atime $TEST_TEXT_FILE`
-    ctime=`get_ctime $TEST_TEXT_FILE`
-    mtime=`get_mtime $TEST_TEXT_FILE`
-    if [ $base_atime -ne $atime -o $base_ctime -eq $ctime -o $base_mtime -ne $mtime ]; then
-       echo "set_xattr expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
-       return 1
+    set_xattr key value "${TEST_TEXT_FILE}"
+    local atime; atime=$(get_atime "${TEST_TEXT_FILE}")
+    local ctime; ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local mtime; mtime=$(get_mtime "${TEST_TEXT_FILE}")
+
+    if ! uname | grep -q Darwin; then
+        if [ "${base_atime}" != "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" != "${mtime}" ]; then
+           echo "set_xattr expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
+           return 1
+        fi
+    else
+        # [FIXME] macos fuse-t
+        # On FUSE-T 1.0.x (libfuse2) atime+ctime were both updated by setxattr
+        # (https://github.com/macos-fuse-t/fuse-t/issues/87). On FUSE-T 1.2.x
+        # (libfuse3) the kernel-cached stat returned to userspace does not
+        # reflect the ctime bump, so all three timestamps appear unchanged.
+        # Permit either observed behavior for now.
+        #
+        if [ "${base_mtime}" != "${mtime}" ]; then
+           echo "set_xattr expected unchanged mtime: $base_mtime == $mtime"
+           return 1
+        fi
+        if [ "${base_atime}" != "${atime}" ] && [ "${base_ctime}" = "${ctime}" ]; then
+           echo "set_xattr expected updated ctime when atime is updated: $base_ctime != $ctime"
+           return 1
+        fi
     fi
+
     rm_test_file
 }
 
 function test_update_time_touch() {
     describe "Testing update time function touch..."
 
-    t0=1000000000  # 9 September 2001
-    OBJECT_NAME="$(basename $PWD)/${TEST_TEXT_FILE}"
-    echo data | aws_cli s3 cp --metadata="atime=$t0,ctime=$t0,mtime=$t0" - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
-    base_atime=`get_atime $TEST_TEXT_FILE`
-    base_ctime=`get_ctime $TEST_TEXT_FILE`
-    base_mtime=`get_mtime $TEST_TEXT_FILE`
+    local t0=1000000000  # 9 September 2001
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
+    echo data | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}"
+    local base_atime; base_atime=$(get_atime "${TEST_TEXT_FILE}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_TEXT_FILE}")
 
     #
     # touch -> update ctime/atime/mtime
     #
-    touch $TEST_TEXT_FILE
-    atime=`get_atime $TEST_TEXT_FILE`
-    ctime=`get_ctime $TEST_TEXT_FILE`
-    mtime=`get_mtime $TEST_TEXT_FILE`
-    if [ $base_atime -eq $atime -o $base_ctime -eq $ctime -o $base_mtime -eq $mtime ]; then
+    touch "${TEST_TEXT_FILE}"
+    local atime; atime=$(get_atime "${TEST_TEXT_FILE}")
+    local ctime; ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local mtime; mtime=$(get_mtime "${TEST_TEXT_FILE}")
+    if [ "${base_atime}" = "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" = "${mtime}" ]; then
        echo "touch expected updated ctime: $base_ctime != $ctime, mtime: $base_mtime != $mtime, atime: $base_atime != $atime"
+       return 1
+    fi
+    rm_test_file
+}
+
+function test_update_time_touch_t() {
+    describe "Testing update time function touch -t..."
+
+    local t0=1000000000  # 9 September 2001
+    echo data > "${TEST_TEXT_FILE}"
+    local base_ctime; base_ctime=$(get_ctime "${TEST_TEXT_FILE}")
+
+    #
+    # touch -t -> set atime/mtime to the given time, update ctime to now
+    #
+    TZ=UTC touch -t 200109090146.40 "${TEST_TEXT_FILE}"
+    local atime; atime=$(get_atime "${TEST_TEXT_FILE}")
+    local ctime; ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local mtime; mtime=$(get_mtime "${TEST_TEXT_FILE}")
+    if [ "${atime%%.*}" != "${t0}" ] || [ "${mtime%%.*}" != "${t0}" ] || [ "${ctime%%.*}" -lt "${base_ctime%%.*}" ]; then
+       echo "touch -t expected atime/mtime: ${t0} == $atime == $mtime and ctime not older than $base_ctime: $ctime"
        return 1
     fi
     rm_test_file
@@ -870,23 +1482,37 @@ function test_update_time_touch() {
 function test_update_time_touch_a() {
     describe "Testing update time function touch -a..."
 
-    t0=1000000000  # 9 September 2001
-    OBJECT_NAME="$(basename $PWD)/${TEST_TEXT_FILE}"
-    echo data | aws_cli s3 cp --metadata="atime=$t0,ctime=$t0,mtime=$t0" - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
-    base_atime=`get_atime $TEST_TEXT_FILE`
-    base_ctime=`get_ctime $TEST_TEXT_FILE`
-    base_mtime=`get_mtime $TEST_TEXT_FILE`
+    local t0=1000000000  # 9 September 2001
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
+    echo data | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}"
+    local base_atime; base_atime=$(get_atime "${TEST_TEXT_FILE}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_TEXT_FILE}")
 
     #
     # "touch -a" -> update ctime/atime, not update mtime
     #
-    touch -a $TEST_TEXT_FILE
-    atime=`get_atime $TEST_TEXT_FILE`
-    ctime=`get_ctime $TEST_TEXT_FILE`
-    mtime=`get_mtime $TEST_TEXT_FILE`
-    if [ $base_atime -eq $atime -o $base_ctime -eq $ctime -o $base_mtime -ne $mtime ]; then
-        echo "touch with -a option expected updated ctime: $base_ctime != $ctime, atime: $base_atime != $atime and same mtime: $base_mtime == $mtime"
-        return 1
+    touch -a "${TEST_TEXT_FILE}"
+
+    local atime; atime=$(get_atime "${TEST_TEXT_FILE}")
+    local ctime; ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local mtime; mtime=$(get_mtime "${TEST_TEXT_FILE}")
+
+    if ! uname | grep -q Darwin; then
+        if [ "${base_atime}" = "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" != "${mtime}" ]; then
+            echo "touch with -a option expected updated ctime: $base_ctime != $ctime, atime: $base_atime != $atime and same mtime: $base_mtime == $mtime"
+            return 1
+        fi
+    else
+        # [macos] fuse-t
+        # atime/ctime are updated.  mtime depends on the macOS NFS client:
+        # older versions (e.g. macOS 14) update it while newer versions
+        # (e.g. macOS 26) preserve it like POSIX requires.
+        #
+        if [ "${base_atime}" = "${atime}" ] || [ "${base_ctime}" = "${ctime}" ]; then
+            echo "touch with -a option expected updated ctime: $base_ctime != $ctime and atime: $base_atime != $atime"
+            return 1
+        fi
     fi
     rm_test_file
 }
@@ -894,21 +1520,21 @@ function test_update_time_touch_a() {
 function test_update_time_append() {
     describe "Testing update time function append..."
 
-    t0=1000000000  # 9 September 2001
-    OBJECT_NAME="$(basename $PWD)/${TEST_TEXT_FILE}"
-    echo data | aws_cli s3 cp --metadata="atime=$t0,ctime=$t0,mtime=$t0" - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
-    base_atime=`get_atime $TEST_TEXT_FILE`
-    base_ctime=`get_ctime $TEST_TEXT_FILE`
-    base_mtime=`get_mtime $TEST_TEXT_FILE`
+    local t0=1000000000  # 9 September 2001
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
+    echo data | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}"
+    local base_atime; base_atime=$(get_atime "${TEST_TEXT_FILE}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_TEXT_FILE}")
 
     #
     # append -> update ctime/mtime, not update atime
     #
-    echo foo >> $TEST_TEXT_FILE
-    atime=`get_atime $TEST_TEXT_FILE`
-    ctime=`get_ctime $TEST_TEXT_FILE`
-    mtime=`get_mtime $TEST_TEXT_FILE`
-    if [ $base_atime -ne $atime -o $base_ctime -eq $ctime -o $base_mtime -eq $mtime ]; then
+    echo foo >> "${TEST_TEXT_FILE}"
+    local atime; atime=$(get_atime "${TEST_TEXT_FILE}")
+    local ctime; ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local mtime; mtime=$(get_mtime "${TEST_TEXT_FILE}")
+    if [ "${base_atime}" != "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" = "${mtime}" ]; then
         echo "append expected updated ctime: $base_ctime != $ctime, mtime: $base_mtime != $mtime and same atime: $base_atime == $atime"
         return 1
     fi
@@ -918,52 +1544,54 @@ function test_update_time_append() {
 function test_update_time_cp_p() {
     describe "Testing update time function cp -p..."
 
-    t0=1000000000  # 9 September 2001
-    OBJECT_NAME="$(basename $PWD)/${TEST_TEXT_FILE}"
-    echo data | aws_cli s3 cp --metadata="atime=$t0,ctime=$t0,mtime=$t0" - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
-    base_atime=`get_atime $TEST_TEXT_FILE`
-    base_ctime=`get_ctime $TEST_TEXT_FILE`
-    base_mtime=`get_mtime $TEST_TEXT_FILE`
+    local t0=1000000000  # 9 September 2001
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
+    echo data | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}"
+    local base_atime; base_atime=$(get_atime "${TEST_TEXT_FILE}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_TEXT_FILE}")
 
     #
     # cp -p -> update ctime, not update atime/mtime
     #
-    TIME_TEST_TEXT_FILE=test-s3fs-time.txt
-    cp -p $TEST_TEXT_FILE $TIME_TEST_TEXT_FILE
-    atime=`get_atime $TIME_TEST_TEXT_FILE`
-    ctime=`get_ctime $TIME_TEST_TEXT_FILE`
-    mtime=`get_mtime $TIME_TEST_TEXT_FILE`
-    if [ $base_atime -ne $atime -o $base_ctime -eq $ctime -o $base_mtime -ne $mtime ]; then
+    local TIME_TEST_TEXT_FILE=test-s3fs-time.txt
+    cp_avoid_xattr_err -p "${TEST_TEXT_FILE}" "${TIME_TEST_TEXT_FILE}"
+    local atime; atime=$(get_atime "${TIME_TEST_TEXT_FILE}")
+    local ctime; ctime=$(get_ctime "${TIME_TEST_TEXT_FILE}")
+    local mtime; mtime=$(get_mtime "${TIME_TEST_TEXT_FILE}")
+    if [ "${base_atime}" != "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" != "${mtime}" ]; then
        echo "cp with -p option expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
        return 1
     fi
+    rm_test_file
+    rm_test_file "${TIME_TEST_TEXT_FILE}"
 }
 
 function test_update_time_mv() {
     describe "Testing update time function mv..."
 
-    t0=1000000000  # 9 September 2001
-    OBJECT_NAME="$(basename $PWD)/${TEST_TEXT_FILE}"
-    echo data | aws_cli s3 cp --metadata="atime=$t0,ctime=$t0,mtime=$t0" - "s3://${TEST_BUCKET_1}/${OBJECT_NAME}"
-    base_atime=`get_atime $TEST_TEXT_FILE`
-    base_ctime=`get_ctime $TEST_TEXT_FILE`
-    base_mtime=`get_mtime $TEST_TEXT_FILE`
+    local t0=1000000000  # 9 September 2001
+    local OBJECT_NAME; OBJECT_NAME=$(basename "${PWD}")/"${TEST_TEXT_FILE}"
+    echo data | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME}" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}"
+    local base_atime; base_atime=$(get_atime "${TEST_TEXT_FILE}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_TEXT_FILE}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_TEXT_FILE}")
 
     #
     # mv -> update ctime, not update atime/mtime
     #
-    TIME2_TEST_TEXT_FILE=test-s3fs-time2.txt
-    mv $TEST_TEXT_FILE $TIME2_TEST_TEXT_FILE
-    atime=`get_atime $TIME2_TEST_TEXT_FILE`
-    ctime=`get_ctime $TIME2_TEST_TEXT_FILE`
-    mtime=`get_mtime $TIME2_TEST_TEXT_FILE`
-    if [ $base_atime -ne $atime -o $base_ctime -eq $ctime -o $base_mtime -ne $mtime ]; then
+    local TIME2_TEST_TEXT_FILE=test-s3fs-time2.txt
+    mv "${TEST_TEXT_FILE}" "${TIME2_TEST_TEXT_FILE}"
+    local atime; atime=$(get_atime "${TIME2_TEST_TEXT_FILE}")
+    local ctime; ctime=$(get_ctime "${TIME2_TEST_TEXT_FILE}")
+    local mtime; mtime=$(get_mtime "${TIME2_TEST_TEXT_FILE}")
+    if [ "${base_atime}" != "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" != "${mtime}" ]; then
        echo "mv expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
        return 1
     fi
 
-    rm_test_file $TIME_TEST_TEXT_FILE
-    rm_test_file $TIME2_TEST_TEXT_FILE
+    rm_test_file "${TIME_TEST_TEXT_FILE}"
+    rm_test_file "${TIME2_TEST_TEXT_FILE}"
 }
 
 # [NOTE]
@@ -976,182 +1604,514 @@ function test_update_directory_time_chmod() {
     #
     # create the directory and sub-directory and a file in directory
     #
-    t0=1000000000  # 9 September 2001
-    DIRECTORY_NAME="$(basename $PWD)/${TEST_DIR}"
-    aws_cli s3api put-object --content-type="application/x-directory" --metadata="atime=$t0,ctime=$t0,mtime=$t0" --bucket "${TEST_BUCKET_1}" --key "$DIRECTORY_NAME/"
+    local t0=1000000000  # 9 September 2001
+    local DIRECTORY_NAME; DIRECTORY_NAME=$(basename "${PWD}")/"${TEST_DIR}"
+    s3_cp "${TEST_BUCKET_1}/${DIRECTORY_NAME}/" --header "Content-Type: application/x-directory" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}" < /dev/null
 
-    base_atime=`get_atime $TEST_DIR`
-    base_ctime=`get_ctime $TEST_DIR`
-    base_mtime=`get_mtime $TEST_DIR`
+    local base_atime; base_atime=$(get_atime "${TEST_DIR}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_DIR}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_DIR}")
 
     #
     # chmod -> update only ctime
     #
-    chmod 0777 $TEST_DIR
-    atime=`get_atime $TEST_DIR`
-    ctime=`get_ctime $TEST_DIR`
-    mtime=`get_mtime $TEST_DIR`
-    if [ $base_atime -ne $atime -o $base_ctime -eq $ctime -o $base_mtime -ne $mtime ]; then
+    chmod 0777 "${TEST_DIR}"
+    local atime; atime=$(get_atime "${TEST_DIR}")
+    local ctime; ctime=$(get_ctime "${TEST_DIR}")
+    local mtime; mtime=$(get_mtime "${TEST_DIR}")
+    if [ "${base_atime}" != "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" != "${mtime}" ]; then
        echo "chmod expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
        return 1
     fi
 
-    rm -rf $TEST_DIR
+    rm -rf "${TEST_DIR}"
 }
 
 function test_update_directory_time_chown {
     describe "Testing update time for directory chown..."
 
-    t0=1000000000  # 9 September 2001
-    DIRECTORY_NAME="$(basename $PWD)/${TEST_DIR}"
-    aws_cli s3api put-object --content-type="application/x-directory" --metadata="atime=$t0,ctime=$t0,mtime=$t0" --bucket "${TEST_BUCKET_1}" --key "$DIRECTORY_NAME/"
+    local t0=1000000000  # 9 September 2001
+    local DIRECTORY_NAME; DIRECTORY_NAME=$(basename "${PWD}")/"${TEST_DIR}"
+    s3_cp "${TEST_BUCKET_1}/${DIRECTORY_NAME}/" --header "Content-Type: application/x-directory" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}" < /dev/null
 
-    base_atime=`get_atime $TEST_DIR`
-    base_ctime=`get_ctime $TEST_DIR`
-    base_mtime=`get_mtime $TEST_DIR`
+    local base_atime; base_atime=$(get_atime "${TEST_DIR}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_DIR}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_DIR}")
     #
     # chown -> update only ctime
     #
-    chown $UID $TEST_DIR
-    atime=`get_atime $TEST_DIR`
-    ctime=`get_ctime $TEST_DIR`
-    mtime=`get_mtime $TEST_DIR`
-    if [ $base_atime -ne $atime -o $base_ctime -eq $ctime -o $base_mtime -ne $mtime ]; then
-       echo "chown expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
-       return 1
+    chown $UID "${TEST_DIR}"
+    local atime; atime=$(get_atime "${TEST_DIR}")
+    local ctime; ctime=$(get_ctime "${TEST_DIR}")
+    local mtime; mtime=$(get_mtime "${TEST_DIR}")
+
+    if ! uname | grep -q Darwin; then
+        if [ "${base_atime}" != "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" != "${mtime}" ]; then
+           echo "chown expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
+           return 1
+        fi
+    else
+        # [macos] fuse-t
+        # atime/ctime/mtime are not updated.
+        #
+        if [ "${base_atime}" != "${atime}" ] || [ "${base_ctime}" != "${ctime}" ] || [ "${base_mtime}" != "${mtime}" ]; then
+            echo "touch with -a option expected updated ctime: $base_ctime == $ctime, atime: $base_atime == $atime and same mtime: $base_mtime == $mtime"
+            return 1
+        fi
     fi
 
-    rm -rf $TEST_DIR
+    rm -rf "${TEST_DIR}"
 }
 
 function test_update_directory_time_set_xattr {
     describe "Testing update time for directory set_xattr..."
 
-    t0=1000000000  # 9 September 2001
-    DIRECTORY_NAME="$(basename $PWD)/${TEST_DIR}"
-    aws_cli s3api put-object --content-type="application/x-directory" --metadata="atime=$t0,ctime=$t0,mtime=$t0" --bucket "${TEST_BUCKET_1}" --key "$DIRECTORY_NAME/"
+    local t0=1000000000  # 9 September 2001
+    local DIRECTORY_NAME; DIRECTORY_NAME=$(basename "${PWD}")/"${TEST_DIR}"
+    s3_cp "${TEST_BUCKET_1}/${DIRECTORY_NAME}/" --header "Content-Type: application/x-directory" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}" < /dev/null
 
-    base_atime=`get_atime $TEST_DIR`
-    base_ctime=`get_ctime $TEST_DIR`
-    base_mtime=`get_mtime $TEST_DIR`
+    local base_atime; base_atime=$(get_atime "${TEST_DIR}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_DIR}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_DIR}")
     #
     # set_xattr -> update only ctime
     #
-    set_xattr key value $TEST_DIR
-    atime=`get_atime $TEST_DIR`
-    ctime=`get_ctime $TEST_DIR`
-    mtime=`get_mtime $TEST_DIR`
-    if [ $base_atime -ne $atime -o $base_ctime -eq $ctime -o $base_mtime -ne $mtime ]; then
-       echo "set_xattr expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
-       return 1
+    set_xattr key value "${TEST_DIR}"
+    local atime; atime=$(get_atime "${TEST_DIR}")
+    local ctime; ctime=$(get_ctime "${TEST_DIR}")
+    local mtime; mtime=$(get_mtime "${TEST_DIR}")
+
+    if ! uname | grep -q Darwin; then
+        if [ "${base_atime}" != "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" != "${mtime}" ]; then
+           echo "set_xattr expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
+           return 1
+        fi
+    else
+        # [macos] fuse-t
+        # atime/mtime are not updated.
+        #
+        if [ "${base_atime}" != "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" != "${mtime}" ]; then
+           echo "set_xattr expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
+           return 1
+        fi
     fi
 
-    rm -rf $TEST_DIR
+    rm -rf "${TEST_DIR}"
 }
 
 function test_update_directory_time_touch {
     describe "Testing update time for directory touch..."
 
-    t0=1000000000  # 9 September 2001
-    DIRECTORY_NAME="$(basename $PWD)/${TEST_DIR}"
-    aws_cli s3api put-object --content-type="application/x-directory" --metadata="atime=$t0,ctime=$t0,mtime=$t0" --bucket "${TEST_BUCKET_1}" --key "$DIRECTORY_NAME/"
+    local t0=1000000000  # 9 September 2001
+    local DIRECTORY_NAME; DIRECTORY_NAME=$(basename "${PWD}")/"${TEST_DIR}"
+    s3_cp "${TEST_BUCKET_1}/${DIRECTORY_NAME}/" --header "Content-Type: application/x-directory" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}" < /dev/null
 
-    base_atime=`get_atime $TEST_DIR`
-    base_ctime=`get_ctime $TEST_DIR`
-    base_mtime=`get_mtime $TEST_DIR`
+    local base_atime; base_atime=$(get_atime "${TEST_DIR}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_DIR}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_DIR}")
     #
     # touch -> update ctime/atime/mtime
     #
-    touch $TEST_DIR
-    atime=`get_atime $TEST_DIR`
-    ctime=`get_ctime $TEST_DIR`
-    mtime=`get_mtime $TEST_DIR`
-    if [ $base_atime -eq $atime -o $base_ctime -eq $ctime -o $base_mtime -eq $mtime ]; then
+    touch "${TEST_DIR}"
+    local atime; atime=$(get_atime "${TEST_DIR}")
+    local ctime; ctime=$(get_ctime "${TEST_DIR}")
+    local mtime; mtime=$(get_mtime "${TEST_DIR}")
+    if [ "${base_atime}" = "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" = "${mtime}" ]; then
        echo "touch expected updated ctime: $base_ctime != $ctime, mtime: $base_mtime != $mtime, atime: $base_atime != $atime"
        return 1
     fi
 
-    rm -rf $TEST_DIR
+    rm -rf "${TEST_DIR}"
 }
 
 function test_update_directory_time_touch_a {
     describe "Testing update time for directory touch -a..."
 
-    t0=1000000000  # 9 September 2001
-    DIRECTORY_NAME="$(basename $PWD)/${TEST_DIR}"
-    aws_cli s3api put-object --content-type="application/x-directory" --metadata="atime=$t0,ctime=$t0,mtime=$t0" --bucket "${TEST_BUCKET_1}" --key "$DIRECTORY_NAME/"
+    local t0=1000000000  # 9 September 2001
+    local DIRECTORY_NAME; DIRECTORY_NAME=$(basename "${PWD}")/"${TEST_DIR}"
+    s3_cp "${TEST_BUCKET_1}/${DIRECTORY_NAME}/" --header "Content-Type: application/x-directory" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}" < /dev/null
 
-    base_atime=`get_atime $TEST_DIR`
-    base_ctime=`get_ctime $TEST_DIR`
-    base_mtime=`get_mtime $TEST_DIR`
+    local base_atime; base_atime=$(get_atime "${TEST_DIR}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_DIR}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_DIR}")
     #
     # "touch -a" -> update ctime/atime, not update mtime
     #
-    touch -a $TEST_DIR
-    atime=`get_atime $TEST_DIR`
-    ctime=`get_ctime $TEST_DIR`
-    mtime=`get_mtime $TEST_DIR`
-    if [ $base_atime -eq $atime -o $base_ctime -eq $ctime -o $base_mtime -ne $mtime ]; then
-        echo "touch with -a option expected updated ctime: $base_ctime != $ctime, atime: $base_atime != $atime and same mtime: $base_mtime == $mtime"
-        return 1
+    touch -a "${TEST_DIR}"
+    local atime; atime=$(get_atime "${TEST_DIR}")
+    local ctime; ctime=$(get_ctime "${TEST_DIR}")
+    local mtime; mtime=$(get_mtime "${TEST_DIR}")
+
+    if ! uname | grep -q Darwin; then
+        if [ "${base_atime}" = "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" != "${mtime}" ]; then
+            echo "touch with -a option expected updated ctime: $base_ctime != $ctime, atime: $base_atime != $atime and same mtime: $base_mtime == $mtime"
+            return 1
+        fi
+    else
+        # [macos] fuse-t
+        # atime/ctime are updated.  mtime depends on the macOS NFS client:
+        # older versions (e.g. macOS 14) update it while newer versions
+        # (e.g. macOS 26) preserve it like POSIX requires.
+        #
+        if [ "${base_atime}" = "${atime}" ] || [ "${base_ctime}" = "${ctime}" ]; then
+            echo "touch with -a option expected updated ctime: $base_ctime != $ctime and atime: $base_atime != $atime"
+            return 1
+        fi
     fi
 
-    rm -rf $TEST_DIR
+    rm -rf "${TEST_DIR}"
 }
 
 function test_update_directory_time_subdir() {
     describe "Testing update time for directory subdirectory..."
 
-    TIME_TEST_SUBDIR="$TEST_DIR/testsubdir"
-    TIME_TEST_FILE_INDIR="$TEST_DIR/testfile"
-    mk_test_dir
-    mkdir $TIME_TEST_SUBDIR
-    touch $TIME_TEST_FILE_INDIR
-    # TODO: remove sleep after improving AWS CLI speed
-    sleep 1
+    local TIME_TEST_SUBDIR="${TEST_DIR}/testsubdir"
+    local TIME_TEST_FILE_INDIR="${TEST_DIR}/testfile"
+    local t0=1000000000  # 9 September 2001
+    local OBJECT_PREFIX; OBJECT_PREFIX=$(basename "${PWD}")
+    s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/${TEST_DIR}/" --header "Content-Type: application/x-directory" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}" < /dev/null
+    s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/${TIME_TEST_SUBDIR}/" --header "Content-Type: application/x-directory" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}" < /dev/null
+    echo data | s3_cp "${TEST_BUCKET_1}/${OBJECT_PREFIX}/${TIME_TEST_FILE_INDIR}" --header "x-amz-meta-atime: ${t0}" --header "x-amz-meta-ctime: ${t0}" --header "x-amz-meta-mtime: ${t0}"
 
-    base_atime=`get_atime $TEST_DIR`
-    base_ctime=`get_ctime $TEST_DIR`
-    base_mtime=`get_mtime $TEST_DIR`
-    subdir_atime=`get_atime $TIME_TEST_SUBDIR`
-    subdir_ctime=`get_ctime $TIME_TEST_SUBDIR`
-    subdir_mtime=`get_mtime $TIME_TEST_SUBDIR`
-    subfile_atime=`get_atime $TIME_TEST_FILE_INDIR`
-    subfile_ctime=`get_ctime $TIME_TEST_FILE_INDIR`
-    subfile_mtime=`get_mtime $TIME_TEST_FILE_INDIR`
+    local base_atime;    base_atime=$(get_atime "${TEST_DIR}")
+    local base_ctime;    base_ctime=$(get_ctime "${TEST_DIR}")
+    local base_mtime;    base_mtime=$(get_mtime "${TEST_DIR}")
+    local subdir_atime;  subdir_atime=$(get_atime "${TIME_TEST_SUBDIR}")
+    local subdir_ctime;  subdir_ctime=$(get_ctime "${TIME_TEST_SUBDIR}")
+    local subdir_mtime;  subdir_mtime=$(get_mtime "${TIME_TEST_SUBDIR}")
+    local subfile_atime; subfile_atime=$(get_atime "${TIME_TEST_FILE_INDIR}")
+    local subfile_ctime; subfile_ctime=$(get_ctime "${TIME_TEST_FILE_INDIR}")
+    local subfile_mtime; subfile_mtime=$(get_mtime "${TIME_TEST_FILE_INDIR}")
     #
     # mv -> update ctime, not update atime/mtime for target directory
     #       not update any for sub-directory and a file
     #
-    TIME_TEST_DIR=timetestdir
-    TIME2_TEST_SUBDIR="$TIME_TEST_DIR/testsubdir"
-    TIME2_TEST_FILE_INDIR="$TIME_TEST_DIR/testfile"
-    mv $TEST_DIR $TIME_TEST_DIR
-    atime=`get_atime $TIME_TEST_DIR`
-    ctime=`get_ctime $TIME_TEST_DIR`
-    mtime=`get_mtime $TIME_TEST_DIR`
-    if [ $base_atime -ne $atime -o $base_ctime -eq $ctime -o $base_mtime -ne $mtime ]; then
+    local TIME_TEST_DIR=timetestdir
+    local TIME2_TEST_SUBDIR="${TIME_TEST_DIR}/testsubdir"
+    local TIME2_TEST_FILE_INDIR="${TIME_TEST_DIR}/testfile"
+    mv "${TEST_DIR}" "${TIME_TEST_DIR}"
+    local atime; atime=$(get_atime "${TIME_TEST_DIR}")
+    local ctime; ctime=$(get_ctime "${TIME_TEST_DIR}")
+    local mtime; mtime=$(get_mtime "${TIME_TEST_DIR}")
+    if [ "${base_atime}" != "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" != "${mtime}" ]; then
        echo "mv expected updated ctime: $base_ctime != $ctime and same mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
        return 1
     fi
-    atime=`get_atime $TIME2_TEST_SUBDIR`
-    ctime=`get_ctime $TIME2_TEST_SUBDIR`
-    mtime=`get_mtime $TIME2_TEST_SUBDIR`
-    if [ $subdir_atime -ne $atime -o $subdir_ctime -ne $ctime -o $subdir_mtime -ne $mtime ]; then
+    atime=$(get_atime "${TIME2_TEST_SUBDIR}")
+    ctime=$(get_ctime "${TIME2_TEST_SUBDIR}")
+    mtime=$(get_mtime "${TIME2_TEST_SUBDIR}")
+    if [ "${subdir_atime}" != "${atime}" ] || [ "${subdir_ctime}" != "${ctime}" ] || [ "${subdir_mtime}" != "${mtime}" ]; then
        echo "mv for sub-directory expected same ctime: $subdir_ctime == $ctime, mtime: $subdir_mtime == $mtime, atime: $subdir_atime == $atime"
        return 1
     fi
-    atime=`get_atime $TIME2_TEST_FILE_INDIR`
-    ctime=`get_ctime $TIME2_TEST_FILE_INDIR`
-    mtime=`get_mtime $TIME2_TEST_FILE_INDIR`
-    if [ $subfile_atime -ne $atime -o $subfile_ctime -ne $ctime -o $subfile_mtime -ne $mtime ]; then
+    atime=$(get_atime "${TIME2_TEST_FILE_INDIR}")
+    ctime=$(get_ctime "${TIME2_TEST_FILE_INDIR}")
+    mtime=$(get_mtime "${TIME2_TEST_FILE_INDIR}")
+    if [ "${subfile_atime}" != "${atime}" ] || [ "${subfile_ctime}" != "${ctime}" ] || [ "${subfile_mtime}" != "${mtime}" ]; then
        echo "mv for a file in directory expected same ctime: $subfile_ctime == $ctime, mtime: $subfile_mtime == $mtime, atime: $subfile_atime == $atime"
        return 1
     fi
 
-    rm -rf $TIME_TEST_SUBDIR
-    rm -rf $TIME_TEST_DIR
-    rm -rf $TEST_DIR
+    rm -rf "${TIME_TEST_SUBDIR}"
+    rm -rf "${TIME_TEST_DIR}"
+    rm -rf "${TEST_DIR}"
+}
+
+# [NOTE]
+# This test changes the file mode while creating/editing a new file,
+# and finally closes it.
+# Test with the sed command as it occurs when in place mode of the sed
+# command. (If trying it with a standard C function(and shell script),
+# it will be not the same result of sed, so sed is used.)
+#
+function test_update_chmod_opened_file() {
+    describe "Testing create, modify the file by sed in place mode"
+
+    # test file
+    local BEFORE_STRING_DATA; BEFORE_STRING_DATA="sed in place test : BEFORE DATA"
+    local AFTER_STRING_DATA;  AFTER_STRING_DATA="sed in place test : AFTER DATA"
+    echo "${BEFORE_STRING_DATA}" > "${TEST_TEXT_FILE}"
+
+    # sed in place
+    sed -i -e 's/BEFORE DATA/AFTER DATA/g' "${TEST_TEXT_FILE}"
+
+    # compare result
+    local RESULT_STRING; RESULT_STRING=$(cat "${TEST_TEXT_FILE}")
+
+    if [ -z "${RESULT_STRING}" ] || [ "${RESULT_STRING}" != "${AFTER_STRING_DATA}" ]; then
+       echo "the file conversion by sed in place command failed."
+       return 1
+    fi
+
+    # clean up
+    rm_test_file "${ALT_TEST_TEXT_FILE}"
+}
+
+function test_update_parent_directory_time_sub() {
+    if [ $# -ne 1 ]; then
+        echo "Internal error: parameter is wrong."
+        return 1
+    fi
+
+    # [NOTE]
+    # Skip test for mknod/mkfifo command.
+    # If run them, ctime/mtime of the parent directory will be updated.
+    #
+    local TEST_PARENTDIR_PARENT="${1}"
+    local TEST_PARENTDIR_FILE="${TEST_PARENTDIR_PARENT}/testfile"
+    local TEST_PARENTDIR_SYMFILE_BASE="testfile2"
+    local TEST_PARENTDIR_FILE_MV="${TEST_PARENTDIR_PARENT}/${TEST_PARENTDIR_SYMFILE_BASE}"
+    local TEST_PARENTDIR_SYMFILE="${TEST_PARENTDIR_PARENT}/symfile"
+    local TEST_PARENTDIR_SYMFILE_MV="${TEST_PARENTDIR_PARENT}/symfile2"
+    local TEST_PARENTDIR_DIR="${TEST_PARENTDIR_PARENT}/testdir"
+    local TEST_PARENTDIR_DIR_MV="${TEST_PARENTDIR_PARENT}/testdir2"
+
+    #
+    # Create file -> Darwin: Not update any
+    #             -> Others: Update parent directory's mtime/ctime
+    #
+    local base_atime; base_atime=$(get_atime "${TEST_PARENTDIR_PARENT}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_PARENTDIR_PARENT}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_PARENTDIR_PARENT}")
+
+    touch "${TEST_PARENTDIR_FILE}"
+
+    local after_atime; after_atime=$(get_atime "${TEST_PARENTDIR_PARENT}")
+    local after_ctime; after_ctime=$(get_ctime "${TEST_PARENTDIR_PARENT}")
+    local after_mtime; after_mtime=$(get_mtime "${TEST_PARENTDIR_PARENT}")
+
+    if [ "${base_atime}" != "${after_atime}" ] || [ "${base_ctime}" = "${after_ctime}" ] || [ "${base_mtime}" = "${after_mtime}" ]; then
+        echo "creating file expected updating ctime/mtime: atime( ${base_atime} == ${after_atime} ), ctime( ${base_ctime} != ${after_ctime} ), mtime( ${base_mtime} != ${after_mtime} )"
+        return 1
+    fi
+
+    #
+    # Update file -> Not update parent directory's atime/mtime/ctime
+    #
+    base_atime="${after_atime}"
+    base_ctime="${after_ctime}"
+    base_mtime="${after_mtime}"
+
+    touch "${TEST_PARENTDIR_FILE}"
+
+    local after_atime; after_atime=$(get_atime "${TEST_PARENTDIR_PARENT}")
+    local after_ctime; after_ctime=$(get_ctime "${TEST_PARENTDIR_PARENT}")
+    local after_mtime; after_mtime=$(get_mtime "${TEST_PARENTDIR_PARENT}")
+
+    if [ "${base_atime}" != "${after_atime}" ] || [ "${base_ctime}" != "${after_ctime}" ] || [ "${base_mtime}" != "${after_mtime}" ]; then
+        echo "updating file expected updating ctime/mtime: atime( ${base_atime} == ${after_atime} ), ctime( ${base_ctime} == ${after_ctime} ), mtime( ${base_mtime} == ${after_mtime} )"
+        return 1
+    fi
+
+    #
+    # Rename file -> Update parent directory's mtime/ctime
+    #
+    base_atime="${after_atime}"
+    base_ctime="${after_ctime}"
+    base_mtime="${after_mtime}"
+
+    mv "${TEST_PARENTDIR_FILE}" "${TEST_PARENTDIR_FILE_MV}"
+
+    local after_atime; after_atime=$(get_atime "${TEST_PARENTDIR_PARENT}")
+    local after_ctime; after_ctime=$(get_ctime "${TEST_PARENTDIR_PARENT}")
+    local after_mtime; after_mtime=$(get_mtime "${TEST_PARENTDIR_PARENT}")
+
+    if [ "${base_atime}" != "${after_atime}" ] || [ "${base_ctime}" = "${after_ctime}" ] || [ "${base_mtime}" = "${after_mtime}" ]; then
+        echo "renaming file expected updating ctime/mtime: atime( ${base_atime} == ${after_atime} ), ctime( ${base_ctime} != ${after_ctime} ), mtime( ${base_mtime} != ${after_mtime} )"
+        return 1
+    fi
+
+    #
+    # Create symbolic link -> Update parent directory's mtime/ctime
+    #
+    base_atime="${after_atime}"
+    base_ctime="${after_ctime}"
+    base_mtime="${after_mtime}"
+
+    ln -s "${TEST_PARENTDIR_SYMFILE_BASE}" "${TEST_PARENTDIR_SYMFILE}"
+
+    local after_atime; after_atime=$(get_atime "${TEST_PARENTDIR_PARENT}")
+    local after_ctime; after_ctime=$(get_ctime "${TEST_PARENTDIR_PARENT}")
+    local after_mtime; after_mtime=$(get_mtime "${TEST_PARENTDIR_PARENT}")
+
+    if [ "${base_atime}" != "${after_atime}" ] || [ "${base_ctime}" = "${after_ctime}" ] || [ "${base_mtime}" = "${after_mtime}" ]; then
+        echo "creating symbolic file expected updating ctime/mtime: atime( ${base_atime} == ${after_atime} ), ctime( ${base_ctime} != ${after_ctime} ), mtime( ${base_mtime} != ${after_mtime} )"
+        return 1
+    fi
+
+    #
+    # Update symbolic file -> Not update parent directory's atime/mtime/ctime
+    #
+    base_atime="${after_atime}"
+    base_ctime="${after_ctime}"
+    base_mtime="${after_mtime}"
+
+    touch "${TEST_PARENTDIR_SYMFILE}"
+
+    local after_atime; after_atime=$(get_atime "${TEST_PARENTDIR_PARENT}")
+    local after_ctime; after_ctime=$(get_ctime "${TEST_PARENTDIR_PARENT}")
+    local after_mtime; after_mtime=$(get_mtime "${TEST_PARENTDIR_PARENT}")
+
+    if [ "${base_atime}" != "${after_atime}" ] || [ "${base_ctime}" != "${after_ctime}" ] || [ "${base_mtime}" != "${after_mtime}" ]; then
+        echo "updating symbolic file expected updating ctime/mtime: atime( ${base_atime} == ${after_atime} ), ctime( ${base_ctime} == ${after_ctime} ), mtime( ${base_mtime} == ${after_mtime} )"
+        return 1
+    fi
+
+    #
+    # Rename symbolic link -> Update parent directory's mtime/ctime
+    #
+    base_atime="${after_atime}"
+    base_ctime="${after_ctime}"
+    base_mtime="${after_mtime}"
+
+    mv "${TEST_PARENTDIR_SYMFILE}" "${TEST_PARENTDIR_SYMFILE_MV}"
+
+    local after_atime; after_atime=$(get_atime "${TEST_PARENTDIR_PARENT}")
+    local after_ctime; after_ctime=$(get_ctime "${TEST_PARENTDIR_PARENT}")
+    local after_mtime; after_mtime=$(get_mtime "${TEST_PARENTDIR_PARENT}")
+
+    if [ "${base_atime}" != "${after_atime}" ] || [ "${base_ctime}" = "${after_ctime}" ] || [ "${base_mtime}" = "${after_mtime}" ]; then
+        echo "renaming symbolic file expected updating ctime/mtime: atime( ${base_atime} == ${after_atime} ), ctime( ${base_ctime} != ${after_ctime} ), mtime( ${base_mtime} != ${after_mtime} )"
+        return 1
+    fi
+
+    #
+    # Delete symbolic link -> Update parent directory's mtime/ctime
+    #
+    base_atime="${after_atime}"
+    base_ctime="${after_ctime}"
+    base_mtime="${after_mtime}"
+
+    rm "${TEST_PARENTDIR_SYMFILE_MV}"
+
+    local after_atime; after_atime=$(get_atime "${TEST_PARENTDIR_PARENT}")
+    local after_ctime; after_ctime=$(get_ctime "${TEST_PARENTDIR_PARENT}")
+    local after_mtime; after_mtime=$(get_mtime "${TEST_PARENTDIR_PARENT}")
+
+    if [ "${base_atime}" != "${after_atime}" ] || [ "${base_ctime}" = "${after_ctime}" ] || [ "${base_mtime}" = "${after_mtime}" ]; then
+        echo "deleting symbolic file expected updating ctime/mtime: atime( ${base_atime} == ${after_atime} ), ctime( ${base_ctime} != ${after_ctime} ), mtime( ${base_mtime} != ${after_mtime} )"
+        return 1
+    fi
+
+    #
+    # Delete file -> Update parent directory's mtime/ctime
+    #
+    base_atime="${after_atime}"
+    base_ctime="${after_ctime}"
+    base_mtime="${after_mtime}"
+
+    rm "${TEST_PARENTDIR_FILE_MV}"
+
+    local after_atime; after_atime=$(get_atime "${TEST_PARENTDIR_PARENT}")
+    local after_ctime; after_ctime=$(get_ctime "${TEST_PARENTDIR_PARENT}")
+    local after_mtime; after_mtime=$(get_mtime "${TEST_PARENTDIR_PARENT}")
+
+    if [ "${base_atime}" != "${after_atime}" ] || [ "${base_ctime}" = "${after_ctime}" ] || [ "${base_mtime}" = "${after_mtime}" ]; then
+        echo "deleting file expected updating ctime/mtime: atime( ${base_atime} == ${after_atime} ), ctime( ${base_ctime} != ${after_ctime} ), mtime( ${base_mtime} != ${after_mtime} )"
+        return 1
+    fi
+
+    #
+    # Create directory -> Update parent directory's mtime/ctime
+    #
+    local base_atime; base_atime=$(get_atime "${TEST_PARENTDIR_PARENT}")
+    local base_ctime; base_ctime=$(get_ctime "${TEST_PARENTDIR_PARENT}")
+    local base_mtime; base_mtime=$(get_mtime "${TEST_PARENTDIR_PARENT}")
+
+    mkdir "${TEST_PARENTDIR_DIR}"
+
+    local after_atime; after_atime=$(get_atime "${TEST_PARENTDIR_PARENT}")
+    local after_ctime; after_ctime=$(get_ctime "${TEST_PARENTDIR_PARENT}")
+    local after_mtime; after_mtime=$(get_mtime "${TEST_PARENTDIR_PARENT}")
+
+    if [ "${base_atime}" != "${after_atime}" ] || [ "${base_ctime}" = "${after_ctime}" ] || [ "${base_mtime}" = "${after_mtime}" ]; then
+        echo "creating directory expected updating ctime/mtime: atime( ${base_atime} == ${after_atime} ), ctime( ${base_ctime} != ${after_ctime} ), mtime( ${base_mtime} != ${after_mtime} )"
+        return 1
+    fi
+
+    #
+    # Update directory -> Not update parent directory's atime/mtime/ctime
+    #
+    base_atime="${after_atime}"
+    base_ctime="${after_ctime}"
+    base_mtime="${after_mtime}"
+
+    touch "${TEST_PARENTDIR_DIR}"
+
+    local after_atime; after_atime=$(get_atime "${TEST_PARENTDIR_PARENT}")
+    local after_ctime; after_ctime=$(get_ctime "${TEST_PARENTDIR_PARENT}")
+    local after_mtime; after_mtime=$(get_mtime "${TEST_PARENTDIR_PARENT}")
+
+    if [ "${base_atime}" != "${after_atime}" ] || [ "${base_ctime}" != "${after_ctime}" ] || [ "${base_mtime}" != "${after_mtime}" ]; then
+        echo "updating directory expected updating ctime/mtime: atime( ${base_atime} == ${after_atime} ), ctime( ${base_ctime} == ${after_ctime} ), mtime( ${base_mtime} == ${after_mtime} )"
+        return 1
+    fi
+
+    #
+    # Rename directory -> Update parent directory's mtime/ctime
+    #
+    base_atime="${after_atime}"
+    base_ctime="${after_ctime}"
+    base_mtime="${after_mtime}"
+
+    mv "${TEST_PARENTDIR_DIR}" "${TEST_PARENTDIR_DIR_MV}"
+
+    local after_atime; after_atime=$(get_atime "${TEST_PARENTDIR_PARENT}")
+    local after_ctime; after_ctime=$(get_ctime "${TEST_PARENTDIR_PARENT}")
+    local after_mtime; after_mtime=$(get_mtime "${TEST_PARENTDIR_PARENT}")
+
+    if [ "${base_atime}" != "${after_atime}" ] || [ "${base_ctime}" = "${after_ctime}" ] || [ "${base_mtime}" = "${after_mtime}" ]; then
+        echo "renaming directory expected updating ctime/mtime: atime( ${base_atime} == ${after_atime} ), ctime( ${base_ctime} != ${after_ctime} ), mtime( ${base_mtime} != ${after_mtime} )"
+        return 1
+    fi
+
+    #
+    # Delete directory -> Update parent directory's mtime/ctime
+    #
+    base_atime="${after_atime}"
+    base_ctime="${after_ctime}"
+    base_mtime="${after_mtime}"
+
+    rm -r "${TEST_PARENTDIR_DIR_MV}"
+
+    local after_atime; after_atime=$(get_atime "${TEST_PARENTDIR_PARENT}")
+    local after_ctime; after_ctime=$(get_ctime "${TEST_PARENTDIR_PARENT}")
+    local after_mtime; after_mtime=$(get_mtime "${TEST_PARENTDIR_PARENT}")
+
+    if [ "${base_atime}" != "${after_atime}" ] || [ "${base_ctime}" = "${after_ctime}" ] || [ "${base_mtime}" = "${after_mtime}" ]; then
+        echo "deleting directory expected updating ctime/mtime: atime( ${base_atime} == ${after_atime} ), ctime( ${base_ctime} != ${after_ctime} ), mtime( ${base_mtime} != ${after_mtime} )"
+        return 1
+    fi
+
+    return 0
+}
+
+function test_update_parent_directory_time() {
+    describe "Testing update time of parent directory..."
+
+    #
+    # Test sub directory
+    #
+    mk_test_dir
+    if ! test_update_parent_directory_time_sub "${TEST_DIR}"; then
+        echo "failed test about updating time of parent directory: ${TEST_DIR}"
+        return 1
+    fi
+    rm -rf "${TEST_DIR}"
+
+    #
+    # Test bucket top directory
+    #
+    # [NOTE]
+    # The current directory for test execution is "<mount point>/testrun-xxxx".
+    # This test checks in the directory at the top of the bucket.
+    #
+    if ! test_update_parent_directory_time_sub ".."; then
+        echo "failed test about updating time of parent directory: ${TEST_DIR}"
+        return 1
+    fi
+
+    return 0
 }
 
 function test_rm_rf_dir {
@@ -1169,6 +2129,205 @@ function test_rm_rf_dir {
        echo "rm -rf did not remove $PWD/dir1"
        return 1
    fi
+}
+
+function test_posix_acl {
+    describe "Testing posix acl function ..."
+
+    #------------------------------------------------------
+    # Directory
+    #------------------------------------------------------
+    local POSIX_ACL_TEST_DIR1="posix_acl_dir1"
+    local POSIX_ACL_TEST_DIR2="posix_acl_dir2"
+    rm -rf "${POSIX_ACL_TEST_DIR1}"
+    rm -rf "${POSIX_ACL_TEST_DIR2}"
+
+    mkdir "${POSIX_ACL_TEST_DIR1}"
+
+    # [NOTE]
+    # Let the target username be "root".
+    # On some systems the USER environment variable may be
+    # empty, so using ${USER} will not give an accurate test.
+    #
+    TARGET_ACL_USER="root"
+
+    #
+    # Set posix acl(not default)
+    #
+    setfacl -m "u:${TARGET_ACL_USER}:rwx" "${POSIX_ACL_TEST_DIR1}"
+    if ! getfacl "${POSIX_ACL_TEST_DIR1}" | grep -q "^user:${TARGET_ACL_USER}:rwx"; then
+       echo "Could not set posix acl(not default) to ${POSIX_ACL_TEST_DIR1} directory"
+       return 1
+    fi
+
+    #
+    # Set posix acl(default)
+    #
+    setfacl -d -m "u:${TARGET_ACL_USER}:rwx" "${POSIX_ACL_TEST_DIR1}"
+    if ! getfacl "${POSIX_ACL_TEST_DIR1}" | grep -q "^default:user:${TARGET_ACL_USER}:rwx"; then
+       echo "Could not set posix acl(default) to ${POSIX_ACL_TEST_DIR1} directory"
+       return 1
+    fi
+
+    #
+    # Rename
+    #
+    mv "${POSIX_ACL_TEST_DIR1}" "${POSIX_ACL_TEST_DIR2}"
+    if ! getfacl "${POSIX_ACL_TEST_DIR2}" | grep -q "^user:${TARGET_ACL_USER}:rwx"; then
+       echo "Could not move with posix acl(not default) to ${POSIX_ACL_TEST_DIR2} directory"
+       return 1
+    fi
+    if ! getfacl "${POSIX_ACL_TEST_DIR2}" | grep -q "^default:user:${TARGET_ACL_USER}:rwx"; then
+       echo "Could not move with posix acl(default) to ${POSIX_ACL_TEST_DIR2} directory"
+       return 1
+    fi
+
+    #
+    # Copy with permission
+    #
+    cp -rp "${POSIX_ACL_TEST_DIR2}" "${POSIX_ACL_TEST_DIR1}"
+    if ! getfacl "${POSIX_ACL_TEST_DIR1}" | grep -q "^user:${TARGET_ACL_USER}:rwx"; then
+       echo "Could not copy with posix acl(not default) to ${POSIX_ACL_TEST_DIR1} directory"
+       return 1
+    fi
+    if ! getfacl "${POSIX_ACL_TEST_DIR1}" | grep -q "^default:user:${TARGET_ACL_USER}:rwx"; then
+       echo "Could not copy with posix acl(default) to ${POSIX_ACL_TEST_DIR1} directory"
+       return 1
+    fi
+
+    #
+    # Overwrite posix acl(not default)
+    #
+    setfacl -m "u:${TARGET_ACL_USER}:r-x" "${POSIX_ACL_TEST_DIR2}"
+    if ! getfacl "${POSIX_ACL_TEST_DIR2}" | grep -q "^user:${TARGET_ACL_USER}:r-x"; then
+       echo "Could not set posix acl(not default) to ${POSIX_ACL_TEST_DIR2} directory"
+       return 1
+    fi
+
+    #
+    # Overwrite posix acl(default)
+    #
+    setfacl -d -m "u:${TARGET_ACL_USER}:r-x" "${POSIX_ACL_TEST_DIR2}"
+    if ! getfacl "${POSIX_ACL_TEST_DIR2}" | grep -q "^default:user:${TARGET_ACL_USER}:r-x"; then
+       echo "Could not set posix acl(default) to ${POSIX_ACL_TEST_DIR2} directory"
+       return 1
+    fi
+
+    #
+    # Remove posix acl(default)
+    #
+    setfacl -k "${POSIX_ACL_TEST_DIR2}"
+    if getfacl "${POSIX_ACL_TEST_DIR2}" | grep -q "^default:user:${TARGET_ACL_USER}"; then
+       echo "Could not remove posix acl(default) to ${POSIX_ACL_TEST_DIR2} directory"
+       return 1
+    fi
+
+    #
+    # Remove posix acl(all)
+    #
+    setfacl -b "${POSIX_ACL_TEST_DIR2}"
+    if getfacl "${POSIX_ACL_TEST_DIR2}" | grep -q "^user:${TARGET_ACL_USER}"; then
+       echo "Could not remove posix acl(all) to ${POSIX_ACL_TEST_DIR2} directory"
+       return 1
+    fi
+
+    #
+    # Copy without permission
+    #
+    rm -rf "${POSIX_ACL_TEST_DIR2}"
+    cp -r "${POSIX_ACL_TEST_DIR1}" "${POSIX_ACL_TEST_DIR2}"
+    if getfacl "${POSIX_ACL_TEST_DIR2}" | grep -q "^default:user:${TARGET_ACL_USER}"; then
+       echo "Could not copy without posix acl(default) to ${POSIX_ACL_TEST_DIR2} directory"
+       return 1
+    fi
+    if getfacl "${POSIX_ACL_TEST_DIR2}" | grep -q "^user:${TARGET_ACL_USER}"; then
+       echo "Could not copy without posix acl(all) to ${POSIX_ACL_TEST_DIR2} directory"
+       return 1
+    fi
+
+    #------------------------------------------------------
+    # File
+    #------------------------------------------------------
+    local POSIX_ACL_TEST_FILE1="posix_acl_dir1/posix_acl_file1"
+    local POSIX_ACL_TEST_FILE2="posix_acl_dir1/posix_acl_file2"
+    local POSIX_ACL_TEST_FILE3="posix_acl_dir2/posix_acl_file3"
+    local POSIX_ACL_TEST_FILE4="posix_acl_dir2/posix_acl_file4"
+    touch "${POSIX_ACL_TEST_FILE1}"
+
+    #
+    # Check default inherited posix acl
+    #
+    if ! getfacl "${POSIX_ACL_TEST_FILE1}" | grep -q "^user:${TARGET_ACL_USER}:rwx"; then
+       echo "Could not set posix acl(inherited default) to ${POSIX_ACL_TEST_FILE1} file"
+       return 1
+    fi
+
+    #
+    # Overwrite posix acl
+    #
+    setfacl -m "u:${TARGET_ACL_USER}:r-x" "${POSIX_ACL_TEST_FILE1}"
+    if ! getfacl "${POSIX_ACL_TEST_FILE1}" | grep -q "^user:${TARGET_ACL_USER}:r-x"; then
+       echo "Could not overwrite posix acl to ${POSIX_ACL_TEST_FILE1} file"
+       return 1
+    fi
+
+    #
+    # Rename
+    #
+    mv "${POSIX_ACL_TEST_FILE1}" "${POSIX_ACL_TEST_FILE2}"
+    if ! getfacl "${POSIX_ACL_TEST_FILE2}" | grep -q "^user:${TARGET_ACL_USER}:r-x"; then
+       echo "Could not move with posix acl to ${POSIX_ACL_TEST_FILE2} file"
+       return 1
+    fi
+
+    #
+    # Copy with permission
+    #
+    cp -p "${POSIX_ACL_TEST_FILE2}" "${POSIX_ACL_TEST_FILE1}"
+    if ! getfacl "${POSIX_ACL_TEST_FILE1}" | grep -q "^user:${TARGET_ACL_USER}:r-x"; then
+       echo "Could not copy with posix acl to ${POSIX_ACL_TEST_FILE1} file"
+       return 1
+    fi
+
+    #
+    # Remove posix acl
+    #
+    setfacl -b "${POSIX_ACL_TEST_FILE2}"
+    if getfacl "${POSIX_ACL_TEST_FILE2}" | grep -q "^default:user:${TARGET_ACL_USER}"; then
+       echo "Could not remove posix acl to ${POSIX_ACL_TEST_FILE2} file"
+       return 1
+    fi
+
+    #
+    # Copy without permission(set parent directory default acl)
+    #
+    rm -f "${POSIX_ACL_TEST_FILE2}"
+    cp "${POSIX_ACL_TEST_FILE1}" "${POSIX_ACL_TEST_FILE2}"
+    if ! getfacl "${POSIX_ACL_TEST_FILE2}" | grep -q "^user:${TARGET_ACL_USER}:rwx"; then
+       echo "Could not copy without posix acl(inherited parent) to ${POSIX_ACL_TEST_FILE2} file"
+       return 1
+    fi
+
+    #
+    # Copy with permission(to no-acl directory)
+    #
+    cp -p "${POSIX_ACL_TEST_FILE1}" "${POSIX_ACL_TEST_FILE3}"
+    if ! getfacl "${POSIX_ACL_TEST_FILE3}" | grep -q "^user:${TARGET_ACL_USER}:r-x"; then
+       echo "Could not copy with posix acl to ${POSIX_ACL_TEST_FILE3} file in no-acl directory"
+       return 1
+    fi
+
+    #
+    # Copy without permission(to no-acl directory)
+    #
+    cp "${POSIX_ACL_TEST_FILE1}" "${POSIX_ACL_TEST_FILE4}"
+    if getfacl "${POSIX_ACL_TEST_FILE4}" | grep -q "^user:${TARGET_ACL_USER}"; then
+       echo "Could not copy without posix acl to ${POSIX_ACL_TEST_FILE4} file in no-acl directory"
+       return 1
+    fi
+
+    rm -rf "${POSIX_ACL_TEST_DIR1}"
+    rm -rf "${POSIX_ACL_TEST_DIR2}"
 }
 
 function test_copy_file {
@@ -1190,36 +2349,47 @@ function test_write_after_seek_ahead {
 
 function test_overwrite_existing_file_range {
     describe "Test overwrite range succeeds ..."
-    dd if=<(seq 1000) of=${TEST_TEXT_FILE}
-    dd if=/dev/zero of=${TEST_TEXT_FILE} seek=1 count=1 bs=1024 conv=notrunc
-    cmp ${TEST_TEXT_FILE} <(
-        seq 1000 | head -c 1024
-        dd if=/dev/zero count=1 bs=1024
-        seq 1000 | tail -c +2049
-    )
+    dd if=<(seq 1000) of="${TEST_TEXT_FILE}"
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=1 count=1 bs=1024 conv=notrunc
+
+    # [NOTE]
+    # In ALPINE, comparisons using redirects often fail.
+    # Therefore, create a real file for comparison and use it.
+    #
+    dd if=<(seq 1000) of=/tmp/cmp_base_file
+    dd if=/dev/zero of=/tmp/cmp_base_file seek=1 count=1 bs=1024 conv=notrunc
+
+    cmp "${TEST_TEXT_FILE}" /tmp/cmp_base_file
+
+    rm_test_file /tmp/cmp_base_file
     rm_test_file
 }
 
 function test_concurrent_directory_updates {
     describe "Test concurrent updates to a directory ..."
-    for i in `seq 5`; do echo foo > $i; done
-    for process in `seq 10`; do
-        for i in `seq 5`; do
-            file=$(ls `seq 5` | ${SED_BIN} -n "$(($RANDOM % 5 + 1))p")
-            cat $file >/dev/null || true
-            rm -f $file
-            echo foo > $file || true
+    for i in $(seq 5); do
+        echo foo > "${i}"
+    done
+    for _ in $(seq 10); do
+        for i in $(seq 5); do
+            local file
+            # shellcheck disable=SC2012,SC2046
+            file=$(ls $(seq 5) | sed -n "$((RANDOM % 5 + 1))p")
+            cat "${file}" >/dev/null || true
+            rm -f "${file}"
+            echo "foo" > "${file}" || true
         done &
     done
     wait
-    rm -f `seq 5`
+    # shellcheck disable=SC2046
+    rm -f $(seq 5)
 }
 
 function test_concurrent_reads {
     describe "Test concurrent reads from a file ..."
-    ../../junk_data $(($BIG_FILE_BLOCK_SIZE * $BIG_FILE_COUNT)) > "${TEST_TEXT_FILE}"
-    for process in `seq 10`; do
-        dd if=${TEST_TEXT_FILE} of=/dev/null seek=$(($RANDOM % $BIG_FILE_LENGTH)) count=16 bs=1024 &
+    ../../junk_data $((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT)) > "${TEST_TEXT_FILE}"
+    for _ in $(seq 10); do
+        dd if="${TEST_TEXT_FILE}" of=/dev/null seek=$((RANDOM % BIG_FILE_LENGTH)) count=16 bs=1024 &
     done
     wait
     rm_test_file
@@ -1227,19 +2397,38 @@ function test_concurrent_reads {
 
 function test_concurrent_writes {
     describe "Test concurrent writes to a file ..."
-    ../../junk_data $(($BIG_FILE_BLOCK_SIZE * $BIG_FILE_COUNT)) > "${TEST_TEXT_FILE}"
-    for process in `seq 10`; do
-        dd if=/dev/zero of=${TEST_TEXT_FILE} seek=$(($RANDOM % $BIG_FILE_LENGTH)) count=16 bs=1024 conv=notrunc &
+
+    ../../junk_data $((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT)) > "${TEST_TEXT_FILE}"
+
+    NUM_PROCS=10
+    PIDS=()
+    for _ in $(seq "${NUM_PROCS}"); do
+        dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=$((RANDOM % BIG_FILE_LENGTH)) count=16 bs=1024 conv=notrunc &
+        PIDS+=($!)
     done
-    wait
+
+    GRC=0
+    for PID in "${PIDS[@]}"; do
+        wait "${PID}"
+        RC=$?
+        [ $RC -ne 0 ] && GRC="${RC}"
+    done
     rm_test_file
+
+    if [ "${GRC}" -ne 0 ]; then
+        echo "unexpected return code: $GRC"
+        return 1
+    fi
 }
 
 function test_open_second_fd {
     describe "read from an open fd ..."
     rm_test_file second_fd_file
+
+    local RESULT
+    # shellcheck disable=SC2094
     RESULT=$( (echo foo ; wc -c < second_fd_file >&2) 2>& 1>second_fd_file)
-    if [ "$RESULT" -ne 4 ]; then
+    if [ "${RESULT}" -ne 4 ]; then
         echo "size mismatch, expected: 4, was: ${RESULT}"
         return 1
     fi
@@ -1248,74 +2437,60 @@ function test_open_second_fd {
 
 function test_write_multiple_offsets {
     describe "test writing to multiple offsets ..."
-    ../../write_multiple_offsets.py ${TEST_TEXT_FILE} 1024 1 $((16 * 1024 * 1024)) 1 $((18 * 1024 * 1024)) 1
-    rm_test_file ${TEST_TEXT_FILE}
+    ../../write_multiblock -f "${TEST_TEXT_FILE}" -p "1024:1" -p "$((16 * 1024 * 1024)):1" -p "$((18 * 1024 * 1024)):1"
+    rm_test_file "${TEST_TEXT_FILE}"
 }
 
 function test_write_multiple_offsets_backwards {
     describe "test writing to multiple offsets ..."
-    ../../write_multiple_offsets.py ${TEST_TEXT_FILE} $((20 * 1024 * 1024 + 1)) 1 $((10 * 1024 * 1024)) 1
-    rm_test_file ${TEST_TEXT_FILE}
+    ../../write_multiblock -f "${TEST_TEXT_FILE}" -p "$((20 * 1024 * 1024 + 1)):1" -p "$((10 * 1024 * 1024)):1"
+    rm_test_file "${TEST_TEXT_FILE}"
 }
 
 function test_clean_up_cache() {
     describe "Test clean up cache ..."
 
-    dir="many_files"
-    count=25
-    mkdir -p $dir
+    local dir="many_files"
+    local count=25
+    mkdir -p "${dir}"
 
-    for x in $(seq $count); do
-        ../../junk_data 10485760 > $dir/file-$x
+    for x in $(seq "${count}"); do
+        ../../junk_data 10485760 > "${dir}"/file-"${x}"
     done
 
-    file_cnt=$(ls $dir | wc -l)
-    if [ $file_cnt != $count ]; then
-        echo "Expected $count files but got $file_cnt"
-        rm -rf $dir
+    local file_list=("${dir}"/*);
+    local file_cnt="${#file_list[@]}"
+    if [ "${file_cnt}" != "${count}" ]; then
+        echo "Expected $count files but got ${file_cnt}"
+        echo "Files: " "${file_list[@]}"
+        rm -rf "${dir}"
         return 1
     fi
-    CACHE_DISK_AVAIL_SIZE=`get_disk_avail_size $CACHE_DIR`
-    if [ "$CACHE_DISK_AVAIL_SIZE" -lt "$ENSURE_DISKFREE_SIZE" ];then
-        echo "Cache disk avail size:$CACHE_DISK_AVAIL_SIZE less than ensure_diskfree size:$ENSURE_DISKFREE_SIZE"
-        rm -rf $dir
+    local CACHE_DISK_AVAIL_SIZE; CACHE_DISK_AVAIL_SIZE=$(get_disk_avail_size "${CACHE_DIR}")
+    if [ "${CACHE_DISK_AVAIL_SIZE}" -lt "${ENSURE_DISKFREE_SIZE}" ];then
+        echo "Cache disk avail size:${CACHE_DISK_AVAIL_SIZE} less than ensure_diskfree size:${ENSURE_DISKFREE_SIZE}"
+        rm -rf "${dir}"
         return 1
     fi
-    rm -rf $dir
+    rm -rf "${dir}"
 }
 
 function test_content_type() {
     describe "Test Content-Type detection ..."
 
-    DIR_NAME="$(basename $PWD)"
+    local DIR_NAME; DIR_NAME=$(basename "${PWD}")
 
     touch "test.txt"
-    CONTENT_TYPE=$(aws_cli s3api head-object --bucket "${TEST_BUCKET_1}" --key "${DIR_NAME}/test.txt" | grep "ContentType")
-    if ! echo $CONTENT_TYPE | grep -q "text/plain"; then
-        echo "Unexpected Content-Type: $CONTENT_TYPE"
-        return 1;
-    fi
+    check_content_type "${DIR_NAME}/test.txt" "text/plain"
 
     touch "test.jpg"
-    CONTENT_TYPE=$(aws_cli s3api head-object --bucket "${TEST_BUCKET_1}" --key "${DIR_NAME}/test.jpg" | grep "ContentType")
-    if ! echo $CONTENT_TYPE | grep -q "image/jpeg"; then
-        echo "Unexpected Content-Type: $CONTENT_TYPE"
-        return 1;
-    fi
+    check_content_type "${DIR_NAME}/test.jpg" "image/jpeg"
 
     touch "test.bin"
-    CONTENT_TYPE=$(aws_cli s3api head-object --bucket "${TEST_BUCKET_1}" --key "${DIR_NAME}/test.bin" | grep "ContentType")
-    if ! echo $CONTENT_TYPE | grep -q "application/octet-stream"; then
-        echo "Unexpected Content-Type: $CONTENT_TYPE"
-        return 1;
-    fi
+    check_content_type "${DIR_NAME}/test.bin" "application/octet-stream"
 
     mkdir "test.dir"
-    CONTENT_TYPE=$(aws_cli s3api head-object --bucket "${TEST_BUCKET_1}" --key "${DIR_NAME}/test.dir/" | grep "ContentType")
-    if ! echo $CONTENT_TYPE | grep -q "application/x-directory"; then
-        echo "Unexpected Content-Type: $CONTENT_TYPE"
-        return 1;
-    fi
+    check_content_type "${DIR_NAME}/test.dir/" "application/x-directory"
 
     rm -f test.txt
     rm -f test.jpg
@@ -1327,32 +2502,44 @@ function test_content_type() {
 function test_truncate_cache() {
     describe "Test make cache files over max cache file size ..."
 
+    # FIXME:
+    # On macos-fuse-t (libfuse3), readdir on directories with many small files
+    # returns duplicate/missing entries (e.g. "28 28 29 29" with 26, 27 absent),
+    # which causes the subsequent rm -rf to fail. Skip until FUSE-T fixes this.
+    #
+    if uname | grep -q Darwin; then
+        return 0
+    fi
+
     for dir in $(seq 2); do
-        mkdir $dir
+        mkdir "${dir}"
         for file in $(seq 75); do
-            touch $dir/$file
+            touch "${dir}/${file}"
         done
-        ls $dir
+
+        ls "${dir}"
     done
 
-    rm -rf `seq 2`
+    # shellcheck disable=SC2046
+    rm -rf $(seq 2)
 }
 
 function test_cache_file_stat() {
     describe "Test cache file stat ..."
 
-    ../../junk_data $(($BIG_FILE_BLOCK_SIZE * $BIG_FILE_COUNT)) > "${BIG_FILE}"
+    ../../junk_data $((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT)) > "${BIG_FILE}"
 
     #
     # The first argument of the script is "testrun-<random>" the directory name.
     #
-    CACHE_TESTRUN_DIR=$1
+    local CACHE_TESTRUN_DIR=$1
 
     #
     # get cache file inode number
     #
-    CACHE_FILE_INODE=$(ls -i ${CACHE_DIR}/${TEST_BUCKET_1}/${CACHE_TESTRUN_DIR}/${BIG_FILE} 2>/dev/null | awk '{print $1}')
-    if [ -z ${CACHE_FILE_INODE} ]; then
+    local CACHE_FILE_INODE
+    CACHE_FILE_INODE=$(get_inode "${CACHE_DIR}/${TEST_BUCKET_1}/${CACHE_TESTRUN_DIR}/${BIG_FILE}")
+    if [ -z "${CACHE_FILE_INODE}" ]; then
         echo "Not found cache file or failed to get inode: ${CACHE_DIR}/${TEST_BUCKET_1}/${CACHE_TESTRUN_DIR}/${BIG_FILE}"
         return 1;
     fi
@@ -1360,9 +2547,9 @@ function test_cache_file_stat() {
     #
     # get lines from cache stat file
     #
-    CACHE_FILE_STAT_LINE_1=$(${SED_BIN} -n 1p ${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${BIG_FILE})
-    CACHE_FILE_STAT_LINE_2=$(${SED_BIN} -n 2p ${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${BIG_FILE})
-    if [ -z ${CACHE_FILE_STAT_LINE_1} ] || [ -z ${CACHE_FILE_STAT_LINE_2} ]; then
+    local CACHE_FILE_STAT_LINE_1; CACHE_FILE_STAT_LINE_1=$(sed -n 1p "${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${BIG_FILE}")
+    local CACHE_FILE_STAT_LINE_2; CACHE_FILE_STAT_LINE_2=$(sed -n 2p "${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${BIG_FILE}")
+    if [ -z "${CACHE_FILE_STAT_LINE_1}" ] || [ -z "${CACHE_FILE_STAT_LINE_2}" ]; then
         echo "could not get first or second line from cache file stat: ${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${BIG_FILE}"
         return 1;
     fi
@@ -1382,20 +2569,20 @@ function test_cache_file_stat() {
     #
     # remove cache files directly
     #
-    rm -f ${CACHE_DIR}/${TEST_BUCKET_1}/${CACHE_TESTRUN_DIR}/${BIG_FILE}
-    rm -f ${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${BIG_FILE}
+    rm -f "${CACHE_DIR}/${TEST_BUCKET_1}/${CACHE_TESTRUN_DIR}/${BIG_FILE}"
+    rm -f "${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${BIG_FILE}"
 
     #
     # write a byte into the middle(not the boundary) of the file
     #
-    CHECK_UPLOAD_OFFSET=$((10 * 1024 * 1024 + 17))
-    dd if=/dev/urandom of="${BIG_FILE}" bs=1 count=1 seek=${CHECK_UPLOAD_OFFSET} conv=notrunc
+    local CHECK_UPLOAD_OFFSET=$((10 * 1024 * 1024 + 17))
+    dd if=/dev/urandom of="${BIG_FILE}" bs=1 count=1 seek="${CHECK_UPLOAD_OFFSET}" conv=notrunc
 
     #
     # get cache file inode number
     #
-    CACHE_FILE_INODE=$(ls -i ${CACHE_DIR}/${TEST_BUCKET_1}/${CACHE_TESTRUN_DIR}/${BIG_FILE} 2>/dev/null | awk '{print $1}')
-    if [ -z ${CACHE_FILE_INODE} ]; then
+    CACHE_FILE_INODE=$(get_inode "${CACHE_DIR}/${TEST_BUCKET_1}/${CACHE_TESTRUN_DIR}/${BIG_FILE}")
+    if [ -z "${CACHE_FILE_INODE}" ]; then
         echo "Not found cache file or failed to get inode: ${CACHE_DIR}/${TEST_BUCKET_1}/${CACHE_TESTRUN_DIR}/${BIG_FILE}"
         return 1;
     fi
@@ -1403,9 +2590,9 @@ function test_cache_file_stat() {
     #
     # get lines from cache stat file
     #
-    CACHE_FILE_STAT_LINE_1=$(${SED_BIN} -n 1p ${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${BIG_FILE})
-    CACHE_FILE_STAT_LINE_E=$(tail -1 ${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${BIG_FILE} 2>/dev/null)
-    if [ -z ${CACHE_FILE_STAT_LINE_1} ] || [ -z ${CACHE_FILE_STAT_LINE_E} ]; then
+    CACHE_FILE_STAT_LINE_1=$(sed -n 1p "${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${BIG_FILE}")
+    local CACHE_FILE_STAT_LINE_E; CACHE_FILE_STAT_LINE_E=$(tail -1 "${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${BIG_FILE}" 2>/dev/null)
+    if [ -z "${CACHE_FILE_STAT_LINE_1}" ] || [ -z "${CACHE_FILE_STAT_LINE_E}" ]; then
         echo "could not get first or end line from cache file stat: ${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${BIG_FILE}"
         return 1;
     fi
@@ -1417,15 +2604,15 @@ function test_cache_file_stat() {
     # differs depending on the processing system etc., then the cache file
     # size is calculated and compared.
     #
-    CACHE_LAST_OFFSET=$(echo ${CACHE_FILE_STAT_LINE_E} | cut -d ":" -f1)
-    CACHE_LAST_SIZE=$(echo ${CACHE_FILE_STAT_LINE_E} | cut -d ":" -f2)
-    CACHE_TOTAL_SIZE=$((${CACHE_LAST_OFFSET} + ${CACHE_LAST_SIZE}))
+    local CACHE_LAST_OFFSET; CACHE_LAST_OFFSET=$(echo "${CACHE_FILE_STAT_LINE_E}" | cut -d ":" -f1)
+    local CACHE_LAST_SIZE;   CACHE_LAST_SIZE=$(echo "${CACHE_FILE_STAT_LINE_E}" | cut -d ":" -f2)
+    local CACHE_TOTAL_SIZE=$((CACHE_LAST_OFFSET + CACHE_LAST_SIZE))
 
     if [ "${CACHE_FILE_STAT_LINE_1}" != "${CACHE_FILE_INODE}:${BIG_FILE_LENGTH}" ]; then
         echo "first line(cache file stat) is different: \"${CACHE_FILE_STAT_LINE_1}\" != \"${CACHE_FILE_INODE}:${BIG_FILE_LENGTH}\""
         return 1;
     fi
-    if [ ${BIG_FILE_LENGTH} -ne ${CACHE_TOTAL_SIZE} ]; then
+    if [ "${BIG_FILE_LENGTH}" -ne "${CACHE_TOTAL_SIZE}" ]; then
         echo "the file size indicated by the cache stat file is different: \"${BIG_FILE_LENGTH}\" != \"${CACHE_TOTAL_SIZE}\""
         return 1;
     fi
@@ -1436,59 +2623,58 @@ function test_cache_file_stat() {
 function test_zero_cache_file_stat() {
     describe "Test zero byte cache file stat ..."
 
-    rm_test_file ${TEST_TEXT_FILE}
+    rm_test_file "${TEST_TEXT_FILE}"
 
     #
     # create empty file
     #
-    touch ${TEST_TEXT_FILE}
+    touch "${TEST_TEXT_FILE}"
 
     #
     # The first argument of the script is "testrun-<random>" the directory name.
     #
-    CACHE_TESTRUN_DIR=$1
+    local CACHE_TESTRUN_DIR=$1
 
     # [NOTE]
     # The stat file is a one-line text file, expecting for "<inode>:0"(ex. "4543937: 0").
     #
-    head -1 ${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${TEST_TEXT_FILE} 2>/dev/null | grep -q ':0$' 2>/dev/null
-    if [ $? -ne 0 ]; then
+    if ! head -1 "${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${TEST_TEXT_FILE}" 2>/dev/null | grep -q ':0$' 2>/dev/null; then
         echo "The cache file stat after creating an empty file is incorrect : ${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${TEST_TEXT_FILE}"
         return 1;
     fi
-    rm_test_file ${TEST_TEXT_FILE}
+    rm_test_file "${TEST_TEXT_FILE}"
 }
 
 function test_upload_sparsefile {
     describe "Testing upload sparse file ..."
 
-    rm_test_file ${BIG_FILE}
-    rm -f ${TEMP_DIR}/${BIG_FILE}
+    rm_test_file "${BIG_FILE}"
+    rm -f "${TEMP_DIR}/${BIG_FILE}"
 
     #
     # Make all HOLE file
     #
-    ${TRUNCATE_BIN} ${BIG_FILE} -s ${BIG_FILE_LENGTH}
+    "${TRUNCATE_BIN}" "${BIG_FILE}" -s "${BIG_FILE_LENGTH}"
 
     #
     # Write some bytes to ABOUT middle in the file
     # (Dare to remove the block breaks)
     #
-    WRITE_POS=$((${BIG_FILE_LENGTH} / 2 - 128))
-    echo -n "0123456789ABCDEF" | dd of="${TEMP_DIR}/${BIG_FILE}" bs=1 count=16 seek=${WRITE_POS} conv=notrunc
+    local WRITE_POS=$((BIG_FILE_LENGTH / 2 - 128))
+    echo -n "0123456789ABCDEF" | dd of="${TEMP_DIR}/${BIG_FILE}" bs=1 count=16 seek="${WRITE_POS}" conv=notrunc
 
     #
     # copy(upload) the file
     #
-    cp ${TEMP_DIR}/${BIG_FILE} ${BIG_FILE}
+    cp "${TEMP_DIR}/${BIG_FILE}" "${BIG_FILE}"
 
     #
     # check
     #
-    cmp ${TEMP_DIR}/${BIG_FILE} ${BIG_FILE}
+    cmp "${TEMP_DIR}/${BIG_FILE}" "${BIG_FILE}"
 
-    rm_test_file ${BIG_FILE}
-    rm -f ${TEMP_DIR}/${BIG_FILE}
+    rm_test_file "${BIG_FILE}"
+    rm -f "${TEMP_DIR}/${BIG_FILE}"
 }
 
 function test_mix_upload_entities() {
@@ -1497,104 +2683,245 @@ function test_mix_upload_entities() {
     #
     # Make test file
     #
-    ../../junk_data $(($BIG_FILE_BLOCK_SIZE * $BIG_FILE_COUNT)) > "${BIG_FILE}"
+    ../../junk_data $((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT)) > "${BIG_FILE}"
 
     #
     # If the cache option is enabled, delete the cache of uploaded files.
     #
-    if [ -f ${CACHE_DIR}/${TEST_BUCKET_1}/${BIG_FILE} ]; then
-        rm -f ${CACHE_DIR}/${TEST_BUCKET_1}/${BIG_FILE}
+    if [ -f "${CACHE_DIR}/${TEST_BUCKET_1}/${BIG_FILE}" ]; then
+        rm -f "${CACHE_DIR}/${TEST_BUCKET_1}/${BIG_FILE}"
     fi
-    if [ -f ${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${BIG_FILE} ]; then
-        rm -f ${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${BIG_FILE}
+    if [ -f "${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${BIG_FILE}" ]; then
+        rm -f "${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${BIG_FILE}"
     fi
 
     #
     # Do a partial write to the file.
     #
-    echo -n "0123456789ABCDEF" | dd of=${BIG_FILE} bs=1 count=16 seek=0 conv=notrunc
-    echo -n "0123456789ABCDEF" | dd of=${BIG_FILE} bs=1 count=16 seek=8192 conv=notrunc
-    echo -n "0123456789ABCDEF" | dd of=${BIG_FILE} bs=1 count=16 seek=1073152 conv=notrunc
-    echo -n "0123456789ABCDEF" | dd of=${BIG_FILE} bs=1 count=16 seek=26214400 conv=notrunc
-    echo -n "0123456789ABCDEF" | dd of=${BIG_FILE} bs=1 count=16 seek=26222592 conv=notrunc
+    echo -n "0123456789ABCDEF" | dd of="${BIG_FILE}" bs=1 count=16 seek=0 conv=notrunc
+    echo -n "0123456789ABCDEF" | dd of="${BIG_FILE}" bs=1 count=16 seek=8192 conv=notrunc
+    echo -n "0123456789ABCDEF" | dd of="${BIG_FILE}" bs=1 count=16 seek=1073152 conv=notrunc
+    echo -n "0123456789ABCDEF" | dd of="${BIG_FILE}" bs=1 count=16 seek=26214400 conv=notrunc
+    echo -n "0123456789ABCDEF" | dd of="${BIG_FILE}" bs=1 count=16 seek=26222592 conv=notrunc
 
     rm_test_file "${BIG_FILE}"
 }
 
 #
 # [NOTE]
-# This test runs last because it uses up disk space and may not recover.
-# This may be a problem, especially on MacOS. (See the comment near the definition
-# line for the ENSURE_DISKFREE_SIZE variable)
+# This test temporarily consumes most of the fake_diskfree budget with a
+# filler file, so it runs last to avoid influencing other tests.
 #
-function test_ensurespace_move_file() {
-    describe "Testing upload(mv) file when diskspace is not enough ..."
+function test_ensurespace_evict_cache_file() {
+    describe "Testing cache eviction when disk space is not enough ..."
+
+    local DIR_NAME; DIR_NAME=$(basename "${PWD}")
+    local EVICTABLE_FILE="ensurespace-evictable.bin"
+    local READ_FILE="ensurespace-read.bin"
+
+    # Each test runs in its own subshell, so this trap deletes the filler
+    # even when the test aborts halfway: leaving it would starve all of the
+    # following tests of the fake_diskfree budget.
+    rm -rf "${CACHE_DIR}/.s3fs_test_tmpdir"
+    mkdir -p "${CACHE_DIR}/.s3fs_test_tmpdir"
+    trap 'rm -rf "${CACHE_DIR}/.s3fs_test_tmpdir"' EXIT
 
     #
-    # Make test file which is not under mountpoint
+    # Cache a closed file that the ensure free disk space processing can
+    # evict later.
     #
-    mkdir -p ${CACHE_DIR}/.s3fs_test_tmpdir
-    ../../junk_data $(($BIG_FILE_BLOCK_SIZE * $BIG_FILE_COUNT)) > "${CACHE_DIR}/.s3fs_test_tmpdir/${BIG_FILE}"
-
-    #
-    # Backup file stat
-    #
-    if [ `uname` = "Darwin" ]; then
-        ORIGINAL_PERMISSIONS=$(stat -f "%u:%g" ${CACHE_DIR}/.s3fs_test_tmpdir/$BIG_FILE)
-    else
-        ORIGINAL_PERMISSIONS=$(stat --format=%u:%g ${CACHE_DIR}/.s3fs_test_tmpdir/$BIG_FILE)
-    fi
-
-    #
-    # Fill the disk size
-    #
-    NOW_CACHE_DISK_AVAIL_SIZE=`get_disk_avail_size ${CACHE_DIR}`
-    TMP_FILE_NO=0
-    while true; do
-      ALLOWED_USING_SIZE=$((NOW_CACHE_DISK_AVAIL_SIZE - ENSURE_DISKFREE_SIZE))
-      if [ ${ALLOWED_USING_SIZE} -gt ${BIG_FILE_LENGTH} ]; then
-          cp -p ${CACHE_DIR}/.s3fs_test_tmpdir/${BIG_FILE} ${CACHE_DIR}/.s3fs_test_tmpdir/${BIG_FILE}_${TMP_FILE_NO}
-          TMP_FILE_NO=$((TMP_FILE_NO + 1))
-      else
-          break;
-      fi
-    done
-
-    #
-    # move file
-    #
-    mv "${CACHE_DIR}/.s3fs_test_tmpdir/${BIG_FILE}" "${BIG_FILE}"
-
-    #
-    # file stat
-    #
-    if [ `uname` = "Darwin" ]; then
-        MOVED_PERMISSIONS=$(stat -f "%u:%g" $BIG_FILE)
-    else
-        MOVED_PERMISSIONS=$(stat --format=%u:%g $BIG_FILE)
-    fi
-    MOVED_FILE_LENGTH=$(ls -l $BIG_FILE | awk '{print $5}')
-
-    #
-    # check
-    #
-    if [ "${MOVED_PERMISSIONS}" != "${ORIGINAL_PERMISSIONS}" ]; then
-        echo "Failed to move file with permission"
-        return 1
-    fi
-    if [ ${MOVED_FILE_LENGTH} -ne ${BIG_FILE_LENGTH} ]; then
-        echo "Failed to move file with file length: ${MOVED_FILE_LENGTH} ${BIG_FILE_LENGTH}"
+    ../../junk_data $((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT)) > "${TEMP_DIR}/${EVICTABLE_FILE}"
+    cp "${TEMP_DIR}/${EVICTABLE_FILE}" "${EVICTABLE_FILE}"
+    if [ ! -f "${CACHE_DIR}/${TEST_BUCKET_1}/${DIR_NAME}/${EVICTABLE_FILE}" ]; then
+        echo "Expect to find cache file of ${EVICTABLE_FILE}, but it is not found"
         return 1
     fi
 
-    rm_test_file "${BIG_FILE}"
-    rm -rf ${CACHE_DIR}/.s3fs_test_tmpdir
+    #
+    # Create the object to read externally so that s3fs has no cache pages
+    # for it.
+    #
+    ../../junk_data $((26 * 1024 * 1024)) > "${TEMP_DIR}/${READ_FILE}"
+    s3_cp "${TEST_BUCKET_1}/${DIR_NAME}/${READ_FILE}" < "${TEMP_DIR}/${READ_FILE}"
+
+    #
+    # Consume the fake free disk space(FAKE_FREE_DISK_SIZE) down to about
+    # 25MB with real bytes.  The budget is drained by everything written to
+    # the cache file system since mounting(in CI a single file system holds
+    # the cache directory, TEMP_DIR and the s3proxy object store), so the
+    # filler is sized from the free space recorded just before mounting
+    # (CACHE_AVAIL_AT_MOUNT) instead of assuming who consumed it.
+    #
+    local NOW_AVAIL; NOW_AVAIL=$(get_disk_avail_size "${CACHE_DIR}")
+    local FILLER_SIZE=$((NOW_AVAIL - CACHE_AVAIL_AT_MOUNT + FAKE_FREE_DISK_SIZE - 25))
+    if [ "${FILLER_SIZE}" -gt 0 ]; then
+        ../../junk_data $((FILLER_SIZE * 1024 * 1024)) > "${CACHE_DIR}/.s3fs_test_tmpdir/filler"
+    fi
+
+    #
+    # Read the whole external object.  Loading it needs more cache space
+    # than the remaining budget, so s3fs must evict the unused cache file
+    # on the way.  A read consumes no disk space besides the cache pages,
+    # which keeps this working when other consumers share the file system.
+    #
+    if ! cmp "${TEMP_DIR}/${READ_FILE}" "${READ_FILE}"; then
+        return 1
+    fi
+
+    if [ -f "${CACHE_DIR}/${TEST_BUCKET_1}/${DIR_NAME}/${EVICTABLE_FILE}" ]; then
+        echo "Expect the cache file of ${EVICTABLE_FILE} to be evicted, but it remains"
+        return 1
+    fi
+
+    #
+    # The evicted file is still readable(downloaded again).
+    #
+    rm -rf "${CACHE_DIR}/.s3fs_test_tmpdir"
+    if ! cmp "${TEMP_DIR}/${EVICTABLE_FILE}" "${EVICTABLE_FILE}"; then
+        return 1
+    fi
+
+    rm -f "${TEMP_DIR}/${EVICTABLE_FILE}"
+    rm -f "${TEMP_DIR}/${READ_FILE}"
+    rm_test_file "${EVICTABLE_FILE}"
+    rm_test_file "${READ_FILE}"
 }
 
-function test_ut_ossfs {
-    describe "Testing ossfs python ut..."
-    export TEST_BUCKET_MOUNT_POINT=$TEST_BUCKET_MOUNT_POINT_1
-    ../../ut_test.py
+#
+# [NOTE]
+# This test temporarily consumes most of the fake_diskfree budget with a
+# filler file, so it runs near the end to avoid influencing other tests.
+#
+function test_diskfull_fallback_upload() {
+    describe "Testing multipart upload fallback when local disk is full ..."
+
+    local DIR_NAME; DIR_NAME=$(basename "${PWD}")
+    local FALLBACK_FILE="diskfull-fallback-test.bin"
+
+    # Each test runs in its own subshell, so this trap deletes the filler
+    # even when the test aborts halfway: leaving it would starve all of the
+    # following tests of the fake_diskfree budget.
+    rm -rf "${CACHE_DIR}/.s3fs_test_diskfull"
+    mkdir -p "${CACHE_DIR}/.s3fs_test_diskfull"
+    trap 'rm -rf "${CACHE_DIR}/.s3fs_test_diskfull"' EXIT
+
+    #
+    # Create the object externally so that s3fs has no local cache pages for it.
+    #
+    ../../junk_data $((26 * 1024 * 1024)) > "${TEMP_DIR}/${FALLBACK_FILE}"
+    s3_cp "${TEST_BUCKET_1}/${DIR_NAME}/${FALLBACK_FILE}" < "${TEMP_DIR}/${FALLBACK_FILE}"
+
+    #
+    # Consume the fake free disk space(FAKE_FREE_DISK_SIZE) down to about
+    # 25MB with real bytes, leaving less room than loading the whole file
+    # locally would need.  The budget is drained by everything written to
+    # the cache file system since mounting(in CI a single file system holds
+    # the cache directory, TEMP_DIR and the s3proxy object store), so the
+    # filler is sized from the free space recorded just before mounting
+    # (CACHE_AVAIL_AT_MOUNT) instead of assuming who consumed it.
+    #
+    local NOW_AVAIL; NOW_AVAIL=$(get_disk_avail_size "${CACHE_DIR}")
+    local FILLER_SIZE=$((NOW_AVAIL - CACHE_AVAIL_AT_MOUNT + FAKE_FREE_DISK_SIZE - 25))
+    if [ "${FILLER_SIZE}" -gt 0 ]; then
+        ../../junk_data $((FILLER_SIZE * 1024 * 1024)) > "${CACHE_DIR}/.s3fs_test_diskfull/filler"
+    fi
+
+    #
+    # Modify 16 bytes every 4MB through one file descriptor.  The unloaded
+    # gaps between the writes are each smaller than the 5MB minimum part
+    # size, so the mix upload cannot copy them server-side and must download
+    # them, which no longer fits in the cache: s3fs switches to the
+    # multipart upload without cache(NoCacheLoadAndPost) mid-write.
+    #
+    ../../write_multiblock -f "${FALLBACK_FILE}" -f "${TEMP_DIR}/${FALLBACK_FILE}" -p "0:16" -p "$((4 * 1024 * 1024)):16" -p "$((8 * 1024 * 1024)):16" -p "$((12 * 1024 * 1024)):16" -p "$((16 * 1024 * 1024)):16" -p "$((20 * 1024 * 1024)):16" -p "$((24 * 1024 * 1024)):16"
+
+    rm -rf "${CACHE_DIR}/.s3fs_test_diskfull"
+
+    if ! cmp "${TEMP_DIR}/${FALLBACK_FILE}" "${FALLBACK_FILE}"; then
+        return 1
+    fi
+
+    rm -f "${TEMP_DIR}/${FALLBACK_FILE}"
+    rm_test_file "${FALLBACK_FILE}"
+}
+
+function test_not_existed_dir_obj() {
+    describe "Test not existed directory object..."
+
+    local DIR_NAME; DIR_NAME=$(basename "${PWD}")
+
+    #
+    # Create files under not existed directory by aws command
+    #
+    local OBJECT_NAME_1; OBJECT_NAME_1="${DIR_NAME}/not_existed_dir_single/${TEST_TEXT_FILE}"
+    local OBJECT_NAME_2; OBJECT_NAME_2="${DIR_NAME}/not_existed_dir_parent/not_existed_dir_child/${TEST_TEXT_FILE}"
+    echo data1 | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME_1}"
+    echo data2 | s3_cp "${TEST_BUCKET_1}/${OBJECT_NAME_2}"
+
+    # Top directory
+    # shellcheck disable=SC2010
+    if ! ls -1 | grep -q '^not_existed_dir_single$'; then
+        echo "Expect to find \"not_existed_dir_single\" directory, but it is not found"
+        return 1
+    fi
+    # shellcheck disable=SC2010
+    if ! ls -1 | grep -q '^not_existed_dir_parent$'; then
+        echo "Expect to find \"not_existed_dir_parent\" directory, but it is not found"
+        return 1
+    fi
+
+    # Single nest directory
+    if ! stat not_existed_dir_single; then
+        echo "Expect to find \"not_existed_dir_single\" directory, but it is not found"
+        return 1
+    fi
+    # shellcheck disable=SC2010
+    if ! ls -1 not_existed_dir_single | grep -q "^${TEST_TEXT_FILE}\$"; then
+        echo "Expect to find \"not_existed_dir_single/${TEST_TEXT_FILE}\" file, but it is not found"
+        return 1
+    fi
+    # shellcheck disable=SC2010
+    if ! ls -1 "not_existed_dir_single/${TEST_TEXT_FILE}" | grep -q "^not_existed_dir_single/${TEST_TEXT_FILE}\$"; then
+        echo "Expect to find \"not_existed_dir_single/${TEST_TEXT_FILE}\" file, but it is not found"
+        return 1
+    fi
+
+    # Double nest directory
+    if ! stat not_existed_dir_parent; then
+        echo "Expect to find \"not_existed_dir_parent\" directory, but it is not found"
+        return 1
+    fi
+    # shellcheck disable=SC2010
+    if ! ls -1 not_existed_dir_parent | grep -q '^not_existed_dir_child'; then
+        echo "Expect to find \"not_existed_dir_parent/not_existed_dir_child\" directory, but it is not found"
+        return 1
+    fi
+    if ! stat not_existed_dir_parent/not_existed_dir_child; then
+        echo "Expect to find \"not_existed_dir_parent/not_existed_dir_child\" directory, but it is not found"
+        return 1
+    fi
+    # shellcheck disable=SC2010
+    if ! ls -1 not_existed_dir_parent/not_existed_dir_child | grep -q "^${TEST_TEXT_FILE}\$"; then
+        echo "Expect to find \"not_existed_dir_parent/not_existed_dir_child/${TEST_TEXT_FILE}\" directory, but it is not found"
+        return 1
+    fi
+    # shellcheck disable=SC2010
+    if ! ls -1 "not_existed_dir_parent/not_existed_dir_child/${TEST_TEXT_FILE}" | grep -q "^not_existed_dir_parent/not_existed_dir_child/${TEST_TEXT_FILE}\$"; then
+        echo "Expect to find \"not_existed_dir_parent/not_existed_dir_child/${TEST_TEXT_FILE}\" directory, but it is not found"
+        return 1
+    fi
+
+    rm -rf not_existed_dir_single
+    rm -rf not_existed_dir_parent
+}
+
+function test_cr_filename {
+    describe "Testing filename with CR code ..."
+
+    # The following tests create a file, test it, and delete it.
+    # So this test just calls the following program.
+    #
+    ../../cr_filename "${TEST_TEXT_FILE}"
 }
 
 #
@@ -1620,10 +2947,10 @@ function test_write_data_with_skip() {
     #
     # The first argument of the script is "testrun-<random>" the directory name.
     #
-    CACHE_TESTRUN_DIR=$1
+    local CACHE_TESTRUN_DIR=$1
 
-    _SKIPWRITE_FILE="test_skipwrite"
-    _TMP_SKIPWRITE_FILE="/tmp/${_SKIPWRITE_FILE}"
+    local _SKIPWRITE_FILE="test_skipwrite"
+    local _TMP_SKIPWRITE_FILE="/tmp/${_SKIPWRITE_FILE}"
 
     #------------------------------------------------------
     # (1) test new file 
@@ -1631,8 +2958,8 @@ function test_write_data_with_skip() {
     #
     # Clean files
     #
-    rm_test_file ${_SKIPWRITE_FILE}
-    rm_test_file ${_TMP_SKIPWRITE_FILE}
+    rm_test_file "${_SKIPWRITE_FILE}"
+    rm_test_file "${_TMP_SKIPWRITE_FILE}"
 
     #
     # Create new file in bucket and temporary directory(/tmp)
@@ -1664,15 +2991,15 @@ function test_write_data_with_skip() {
     #
     # delete cache file if using cache
     #
-    if ps u $S3FS_PID | grep -q use_cache; then
-        rm -f ${CACHE_DIR}/${TEST_BUCKET_1}/${CACHE_TESTRUN_DIR}/${_SKIPWRITE_FILE}
-        rm -f ${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${_SKIPWRITE_FILE}
+    if s3fs_args | grep -q use_cache; then
+        rm -f "${CACHE_DIR}/${TEST_BUCKET_1}/${CACHE_TESTRUN_DIR}/${_SKIPWRITE_FILE}"
+        rm -f "${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${_SKIPWRITE_FILE}"
     fi
 
     #
     # Compare
     #
-    cmp ${_SKIPWRITE_FILE} ${_TMP_SKIPWRITE_FILE}
+    cmp "${_SKIPWRITE_FILE}" "${_TMP_SKIPWRITE_FILE}"
 
     #------------------------------------------------------
     # (2) test existed file
@@ -1680,9 +3007,9 @@ function test_write_data_with_skip() {
     # [NOTE]
     # This test uses the file used in the previous test as an existing file.
     #
-    if ps u $S3FS_PID | grep -q use_cache; then
-        rm -f ${CACHE_DIR}/${TEST_BUCKET_1}/${CACHE_TESTRUN_DIR}/${_SKIPWRITE_FILE}
-        rm -f ${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${_SKIPWRITE_FILE}
+    if s3fs_args | grep -q use_cache; then
+        rm -f "${CACHE_DIR}/${TEST_BUCKET_1}/${CACHE_TESTRUN_DIR}/${_SKIPWRITE_FILE}"
+        rm -f "${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${_SKIPWRITE_FILE}"
     fi
 
     #
@@ -1717,29 +3044,332 @@ function test_write_data_with_skip() {
     #
     # delete cache file if using cache
     #
-    if ps u $S3FS_PID | grep -q use_cache; then
-        rm -f ${CACHE_DIR}/${TEST_BUCKET_1}/${CACHE_TESTRUN_DIR}/${_SKIPWRITE_FILE}
-        rm -f ${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${_SKIPWRITE_FILE}
+    if s3fs_args | grep -q use_cache; then
+        rm -f "${CACHE_DIR}/${TEST_BUCKET_1}/${CACHE_TESTRUN_DIR}/${_SKIPWRITE_FILE}"
+        rm -f "${CACHE_DIR}/.${TEST_BUCKET_1}.stat/${CACHE_TESTRUN_DIR}/${_SKIPWRITE_FILE}"
     fi
 
     #
     # Compare
     #
-    cmp ${_SKIPWRITE_FILE} ${_TMP_SKIPWRITE_FILE}
+    cmp "${_SKIPWRITE_FILE}" "${_TMP_SKIPWRITE_FILE}"
 
     #
     # Clean files
     #
-    rm_test_file ${_SKIPWRITE_FILE}
-    rm_test_file ${_TMP_SKIPWRITE_FILE}
+    rm_test_file "${_SKIPWRITE_FILE}"
+    rm_test_file "${_TMP_SKIPWRITE_FILE}"
+}
+
+function test_not_boundary_writes {
+    describe "Test non-boundary write ..."
+
+    # [MEMO]
+    # Files used in this test, multipart related sizes, etc.
+    #
+    #    Test file size:                25MB(25 * 1024 * 1024)
+    #    Multipart size:                10MB
+    #    Multipart minimum upload size:  5MB
+    #
+    # The multipart upload part that should be executed here is as follows:
+    #    Part number 1:             0 - 10,485,759 (size = 10MB)
+    #    Part number 2:    10,485,760 - 20,971,519 (size = 10MB)
+    #    Part number 3:    20,971,520 - 26,214,399 (size =  5MB)
+    #
+    local BOUNDARY_TEST_FILE_SIZE; BOUNDARY_TEST_FILE_SIZE=$((BIG_FILE_BLOCK_SIZE * BIG_FILE_COUNT))
+
+    ../../junk_data "${BOUNDARY_TEST_FILE_SIZE}" > "${TEST_TEXT_FILE}"
+
+    #
+    # Write in First boundary
+    #
+    # Write 0 - 3,145,727(3MB) : less than the multipart minimum size from the beginning
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=0 count=3072 bs=1024 conv=notrunc
+
+    # Write 0 - 7,340,031(7MB) : multipart exceeding the minimum size from the beginning
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=0 count=7168 bs=1024 conv=notrunc
+
+    # Write 0 - 12,582,911(12MB) : beyond the multipart size boundary from the beginning
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=0 count=12288 bs=1024 conv=notrunc
+
+    #
+    # Write in First and second boundary
+    #
+    # Write 3,145,728 - 4,194,303(1MB) : less than the minimum multipart size from the middle of the first multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=3072 count=1024 bs=1024 conv=notrunc
+
+    # Write 3,145,728 - 9,437,183(6MB) : exceeding the minimum multipart size from the middle of the first multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=3072 count=6144 bs=1024 conv=notrunc
+
+    # Write 3,145,728 - 12,582,911(9MB) : beyond the multipart boundary from the middle of the first multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=3072 count=9216 bs=1024 conv=notrunc
+
+    #
+    # Write in Second boundary
+    #
+    # Write 12,582,912 - 14,680,063(2MB) : below the minimum multipart size from the middle of the multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=12288 count=2048 bs=1024 conv=notrunc
+
+    # Write 12,582,912 - 18,874,367(6MB) : data exceeding the minimum multipart size from the middle of the multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=12288 count=6144 bs=1024 conv=notrunc
+
+    # Write 12,582,912 - 23,068,671(10MB) : beyond the multipart boundary from the middle of the multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=12288 count=10240 bs=1024 conv=notrunc
+
+    # Write 12,582,912 - 26,214,399(13MB) : beyond the multipart boundary(last) from the middle of the multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=12288 count=13312 bs=1024 conv=notrunc
+
+    #
+    # Write in Last boundary
+    #
+    # Write 23,068,672 - 24,117,247(1MB) : below the minimum multipart size from the middle of the final multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=22528 count=1024 bs=1024 conv=notrunc
+
+    # Write 23,068,672 - 26,214,399(3MB) : beyond the multipart boundary(last) from the middle of the final multipart area
+    dd if=/dev/zero of="${TEST_TEXT_FILE}" seek=22528 count=3072 bs=1024 conv=notrunc
+
+    rm_test_file
+}
+
+function test_chmod_mountpoint {
+    describe "Testing chmod to mount point..."
+
+    local MOUNTPOINT_DIR; MOUNTPOINT_DIR=$(cd ..; pwd)
+
+    local ORIGINAL_PERMISSIONS; ORIGINAL_PERMISSIONS=$(get_permissions "${MOUNTPOINT_DIR}")
+
+    chmod 0777 "${MOUNTPOINT_DIR}";
+
+    # if they're the same, we have a problem.
+    local CHANGED_PERMISSIONS; CHANGED_PERMISSIONS=$(get_permissions "${MOUNTPOINT_DIR}")
+    if [ "${CHANGED_PERMISSIONS}" = "${ORIGINAL_PERMISSIONS}" ]
+    then
+      echo "Could not modify mount point(${MOUNTPOINT_DIR}) permissions"
+      return 1
+    fi
+}
+
+function test_chown_mountpoint {
+    describe "Testing chown mount point..."
+
+    local MOUNTPOINT_DIR; MOUNTPOINT_DIR=$(cd ..; pwd)
+
+    local ORIGINAL_PERMISSIONS
+    ORIGINAL_PERMISSIONS=$(get_user_and_group "${MOUNTPOINT_DIR}")
+
+    # [NOTE]
+    # Prevents test interruptions due to permission errors, etc.
+    # If the chown command fails, an error will occur with the
+    # following judgment statement. So skip the chown command error.
+    # '|| true' was added due to a problem with MacOS and ensure_diskfree option.
+    #
+    chown 1000:1000 "${MOUNTPOINT_DIR}" || true
+
+    # if they're the same, we have a problem.
+    local CHANGED_PERMISSIONS
+    CHANGED_PERMISSIONS=$(get_user_and_group "${MOUNTPOINT_DIR}")
+    if [ "${CHANGED_PERMISSIONS}" = "${ORIGINAL_PERMISSIONS}" ]
+    then
+      if [ "${ORIGINAL_PERMISSIONS}" = "1000:1000" ]
+      then
+        echo "Could not be strict check because original file permission 1000:1000"
+      else
+        echo "Could not modify mount point(${MOUNTPOINT_DIR}) ownership($ORIGINAL_PERMISSIONS to 1000:1000)"
+        return 1
+      fi
+    fi
+}
+
+function test_time_mountpoint {
+    describe "Testing atime/ctime/mtime to mount point..."
+
+    local MOUNTPOINT_DIR; MOUNTPOINT_DIR=$(cd ..; pwd)
+
+    local base_atime; base_atime=$(get_atime "${MOUNTPOINT_DIR}")
+    local base_ctime; base_ctime=$(get_ctime "${MOUNTPOINT_DIR}")
+    local base_mtime; base_mtime=$(get_mtime "${MOUNTPOINT_DIR}")
+
+    touch "${MOUNTPOINT_DIR}"
+
+    local atime; atime=$(get_atime "${MOUNTPOINT_DIR}")
+    local ctime; ctime=$(get_ctime "${MOUNTPOINT_DIR}")
+    local mtime; mtime=$(get_mtime "${MOUNTPOINT_DIR}")
+
+    if [ "${base_atime}" = "${atime}" ] || [ "${base_ctime}" = "${ctime}" ] || [ "${base_mtime}" = "${mtime}" ]; then
+       echo "chmod expected updated ctime: $base_ctime != $ctime, mtime: $base_mtime == $mtime, atime: $base_atime == $atime"
+       return 1
+    fi
+}
+
+function test_file_names_longer_than_posix() {
+    local DIR_NAME; DIR_NAME=$(basename "${PWD}")
+    a256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    #a256="aaaa"
+
+    if ! touch "${a256}"; then
+        echo "could not create long file name"
+        return 1
+    fi
+    rm -f "${a256}"
+
+    echo data | s3_cp "${TEST_BUCKET_1}/${DIR_NAME}/${a256}"
+    files=(*)
+    if [ "${#files[@]}" = 0 ]; then
+        echo "failed to list long file name"
+        return 1
+    fi
+    rm -f "${a256}"
+}
+
+function test_statvfs() {
+    describe "Testing the free/available size on mount point(statvfs)..."
+
+    # [NOTE]
+    # The df command result format is different between Linux and macos,
+    # but the order of Total/Used/Available size is the same.
+    #
+    local MOUNTPOINT_DIR; MOUNTPOINT_DIR=$(cd ..; pwd)
+    local TOTAL_SIZE
+    local USED_SIZE
+    local AVAIL_SIZE
+    read -r _ TOTAL_SIZE USED_SIZE AVAIL_SIZE _ < <(df "${MOUNTPOINT_DIR}" 2>/dev/null | tail -n +2)
+
+    # [NOTE]
+    # In the disk information (statvfs) provided by s3fs, Total size and
+    # Available size are always the same and not 0, and used size is always 0.
+    #
+    if [ -z "${TOTAL_SIZE}" ] || [ -z "${AVAIL_SIZE}" ] || [ -z "${USED_SIZE}" ] || [ "${TOTAL_SIZE}" = "0" ] || [ "${AVAIL_SIZE}" = "0" ] || [ "${TOTAL_SIZE}" != "${AVAIL_SIZE}" ] || [ "${USED_SIZE}" != "0" ]; then
+        echo "The result of df <mount point> command is wrong: Total=${TOTAL_SIZE}, Used=${USED_SIZE}, Available=${AVAIL_SIZE}"
+        return 1
+    fi
+}
+
+function test_pjdfstest_chflags() {
+    describe "Testing the pjdfstest : chflags..."
+
+    prove -rv ../../pjdfstest/tests/chflags/*.t
+}
+
+function test_pjdfstest_chmod() {
+    describe "Testing the pjdfstest : chmod..."
+
+    prove -rv ../../pjdfstest/tests/chmod/0[4689].t \
+              ../../pjdfstest/tests/chmod/10.t
+}
+
+function test_pjdfstest_chown() {
+    describe "Testing the pjdfstest : chown..."
+
+    prove -rv ../../pjdfstest/tests/chown/0[4689].t \
+              ../../pjdfstest/tests/chown/10.t
+}
+
+function test_pjdfstest_ftruncate() {
+    describe "Testing the pjdfstest : ftruncate..."
+
+    prove -rv ../../pjdfstest/tests/ftruncate/0[147-9].t \
+              ../../pjdfstest/tests/ftruncate/1[0134].t
+}
+
+function test_pjdfstest_granular() {
+    describe "Testing the pjdfstest : granular..."
+
+    prove -rv ../../pjdfstest/tests/granular/*.t
+}
+
+function test_pjdfstest_link() {
+    describe "Testing the pjdfstest : link..."
+
+    prove -rv ../../pjdfstest/tests/link/*.t
+}
+
+function test_pjdfstest_mkdir() {
+    describe "Testing the pjdfstest : mkdir..."
+
+    prove -rv ../../pjdfstest/tests/mkdir/0[347-9].t \
+              ../../pjdfstest/tests/mkdir/1[12]*.t
+}
+
+function test_pjdfstest_mkfifo() {
+    describe "Testing the pjdfstest : mkfifo..."
+
+    prove -rv ../../pjdfstest/tests/mkfifo/0[3478].t \
+              ../../pjdfstest/tests/mkfifo/1*.t
+}
+
+function test_pjdfstest_mknod() {
+    describe "Testing the pjdfstest : mknod..."
+
+    prove -rv ../../pjdfstest/tests/mknod/0[479].t \
+              ../../pjdfstest/tests/mknod/10.t
+}
+
+function test_pjdfstest_open() {
+    describe "Testing the pjdfstest : open..."
+
+    prove -rv ../../pjdfstest/tests/open/0[49].t \
+              ../../pjdfstest/tests/open/1*.t \
+              ../../pjdfstest/tests/open/2[0-134].t
+}
+
+function test_pjdfstest_posix_fallocate() {
+    describe "Testing the pjdfstest : posix_fallocate..."
+
+    prove -rv ../../pjdfstest/tests/posix_fallocate/*.t
+}
+
+function test_pjdfstest_rename() {
+    describe "Testing the pjdfstest : rename..."
+
+    prove -rv ../../pjdfstest/tests/rename/0[2-36-8].t \
+              ../../pjdfstest/tests/rename/1[15-9].t \
+              ../../pjdfstest/tests/rename/22.t
+}
+
+function test_pjdfstest_rmdir() {
+    describe "Testing the pjdfstest : rmdir..."
+
+    # TODO: explain exclusions
+    # fails with -o use_cache: ../../pjdfstest/tests/rmdir/01.t
+    prove -rv ../../pjdfstest/tests/rmdir/0[3-59].t \
+              ../../pjdfstest/tests/rmdir/1[02-5].t
+}
+
+function test_pjdfstest_symlink() {
+    describe "Testing the pjdfstest : symlink..."
+
+    prove -rv ../../pjdfstest/tests/symlink/0[13479].t \
+              ../../pjdfstest/tests/symlink/1*.t
+}
+
+function test_pjdfstest_truncate() {
+    describe "Testing the pjdfstest : truncate..."
+
+    prove -rv ../../pjdfstest/tests/truncate/0[147-9].t \
+              ../../pjdfstest/tests/truncate/1[0134].t
+}
+
+function test_pjdfstest_unlink() {
+    describe "Testing the pjdfstest : unlink..."
+
+    prove -rv ../../pjdfstest/tests/unlink/0[47-8].t \
+              ../../pjdfstest/tests/unlink/1[02-4].t
+}
+
+function test_pjdfstest_utimensat() {
+    describe "Testing the pjdfstest : utimensat..."
+
+    prove -rv ../../pjdfstest/tests/utimensat/0[1-58-9].t
 }
 
 function add_all_tests {
-    if ps u $S3FS_PID | grep -q use_cache; then
+    if s3fs_args | grep -q use_cache; then
         add_tests test_cache_file_stat
         add_tests test_zero_cache_file_stat
+    else
+        add_tests test_file_names_longer_than_posix
     fi
-    if ! ps u $S3FS_PID | grep -q ensure_diskfree && ! uname | grep -q Darwin; then
+    if ! s3fs_args | grep -q ensure_diskfree && ! uname | grep -q Darwin; then
         add_tests test_clean_up_cache
     fi
     add_tests test_create_empty_file
@@ -1747,8 +3377,14 @@ function add_all_tests {
     add_tests test_truncate_file
     add_tests test_truncate_upload
     add_tests test_truncate_empty_file
+    add_tests test_truncate_shrink_file
+    add_tests test_truncate_grow_file
+    add_tests test_truncate_shrink_read_file
+    add_tests test_truncate_closed_file
+    add_tests test_unlink_open_file
     add_tests test_mv_file
     add_tests test_mv_to_exist_file
+    add_tests test_rename_onto_open_file
     add_tests test_mv_empty_directory
     add_tests test_mv_nonempty_directory
     add_tests test_redirects
@@ -1757,30 +3393,64 @@ function add_all_tests {
     add_tests test_chown
     add_tests test_list
     add_tests test_remove_nonempty_directory
-    if ! ps u $S3FS_PID | grep -q notsup_compat_dir; then
-        # TODO: investigate why notsup_compat_dir fails
-        add_tests test_external_directory_creation
-    fi
+    add_tests test_list_directory_after_failed_rmdir
+    add_tests test_rename_directory_after_list
+    add_tests test_rename_directory_without_subdir_object
+    add_tests test_external_directory_creation
+    add_tests test_external_no_slash_directory_object
+    add_tests test_chmod_listed_directory_keeps_metadata
     add_tests test_external_modification
+    add_tests test_external_creation
     add_tests test_read_external_object
+    add_tests test_read_external_dir_object
     add_tests test_update_metadata_external_small_object
     add_tests test_update_metadata_external_large_object
     add_tests test_rename_before_close
     add_tests test_multipart_upload
     add_tests test_multipart_copy
-    add_tests test_multipart_mix
+    if s3fs_args | grep -q multipart_copy_size; then
+        add_tests test_multipart_copy_chmod
+    fi
+
+    if ! uname | grep -q Darwin || ! s3fs_args | grep -q nocopyapi; then
+        # FIXME:
+        # If you specify the nocopyapi option with macos-fuse-t, the following error will
+        # occur when manipulating the xattr of the copied object:
+        #    "could not copy extended attributes to <file>: Result too large"
+        # As no solution has been found at this time, this test is bypassed on macos with
+        # nocopyapi.
+        # Please pay attention to future developments in macos-fuse-t.
+        #
+        add_tests test_multipart_mix
+    fi
+    if s3fs_args | grep -q max_dirty_data; then
+        add_tests test_max_dirty_data_flush
+    fi
+
     add_tests test_utimens_during_multipart
     add_tests test_special_characters
     add_tests test_hardlink
-    add_tests test_symlink
-    add_tests test_extended_attributes
+
+    # TODO: Related Issue #2832
+    # The symlink test fails on macOS.
+    # This is a bug not caused by s3fs-fuse. Therefore, the test will be temporarily bypassed.
+    # This condition will be removed once the related issue is resolved.
+    #
+    if ! uname | grep -q Darwin; then
+        add_tests test_symlink
+    fi
+    if ! uname | grep -q Darwin; then
+        add_tests test_mknod
+        add_tests test_extended_attributes
+    fi
     add_tests test_mtime_file
 
     add_tests test_update_time_chmod
     add_tests test_update_time_chown
     add_tests test_update_time_xattr
     add_tests test_update_time_touch
-    if [ -e /proc/mounts ] && ! grep "^s3fs " < /proc/mounts | grep "$TEST_BUCKET_MOUNT_POINT_1 " | grep -q -e noatime -e relatime ; then
+    add_tests test_update_time_touch_t
+    if ! mount -t fuse.s3fs | grep "$TEST_BUCKET_MOUNT_POINT_1 " | grep -q -e noatime -e relatime ; then
         add_tests test_update_time_touch_a
     fi
     add_tests test_update_time_append
@@ -1789,12 +3459,43 @@ function add_all_tests {
 
     add_tests test_update_directory_time_chmod
     add_tests test_update_directory_time_chown
-    add_tests test_update_directory_time_set_xattr
     add_tests test_update_directory_time_touch
-    if [ -e /proc/mounts ] && ! grep "^s3fs " < /proc/mounts | grep "$TEST_BUCKET_MOUNT_POINT_1 " | grep -q -e noatime -e relatime ; then
+    if ! mount -t fuse.s3fs | grep "$TEST_BUCKET_MOUNT_POINT_1 " | grep -q -e noatime -e relatime ; then
         add_tests test_update_directory_time_touch_a
     fi
-    add_tests test_update_directory_time_subdir
+    if ! uname | grep -q Darwin; then
+        # FIXME:
+        # These test fail in macos-fuse-t because mtime/ctime/atime are not updated.
+        # Currently, these are not an issue with s3fs, so we will bypass this test for macos.
+        # Please pay attention to future developments in macos-fuse-t.
+        #
+        add_tests test_update_directory_time_set_xattr
+        add_tests test_update_directory_time_subdir
+    fi
+    add_tests test_update_chmod_opened_file
+    if s3fs_args | grep -q update_parent_dir_stat; then
+        if ! uname | grep -q Darwin; then
+            # FIXME:
+            # In macos-fuse-t, this test can sometimes succeed if the test waits for more
+            # than one second while it is processing.
+            # However, the results are currently unstable, thus this test is bypassed on macos.
+            # Please pay attention to future developments in macos-fuse-t.
+            #
+            add_tests test_update_parent_directory_time
+        fi
+    fi
+    # [NOTE]
+    # Requires the xattr handlers, which are registered only with use_xattr
+    # (always passed by start_s3fs).  macOS has no setfacl/getfacl.
+    #
+    # TODO: Ubuntu 26.10 uses uutils cp, whose cp -r copies POSIX ACLs.
+    # Re-enable after a release includes the fix from
+    # https://github.com/uutils/coreutils/pull/15398
+    #
+    if ! uname | grep -q Darwin && command -v setfacl >/dev/null 2>&1 &&
+       ! grep -qx 'VERSION_ID="26.10"' /etc/os-release 2>/dev/null; then
+        add_tests test_posix_acl
+    fi
 
     add_tests test_rm_rf_dir
     add_tests test_copy_file
@@ -1810,11 +3511,63 @@ function add_all_tests {
     add_tests test_truncate_cache
     add_tests test_upload_sparsefile
     add_tests test_mix_upload_entities
-    add_tests test_ut_ossfs
-    if ! ps u $S3FS_PID | grep -q ensure_diskfree && ! uname | grep -q Darwin; then
-        add_tests test_ensurespace_move_file
+    # TODO: investigate why only Alpine cannot see the implicit directory objects.
+    if ! test -f /etc/os-release || ! grep -q -i -e 'ID=alpine' -e 'ID="alpine"' /etc/os-release; then
+        add_tests test_not_existed_dir_obj
     fi
+    add_tests test_cr_filename
     add_tests test_write_data_with_skip
+    add_tests test_not_boundary_writes
+    if s3fs_args | grep -q fake_diskfree && ! s3fs_args | grep -q streamupload && ! uname | grep -q Darwin; then
+        add_tests test_ensurespace_evict_cache_file
+        add_tests test_diskfull_fallback_upload
+    fi
+
+    # [NOTE]
+    # The test on CI will fail depending on the permissions, so skip these(chmod/chown).
+    #
+    # add_tests test_chmod_mountpoint
+    # add_tests test_chown_mountpoint
+    add_tests test_time_mountpoint
+    add_tests test_statvfs
+
+    if ! uname | grep -q Darwin; then
+        add_tests test_pjdfstest_chflags
+        add_tests test_pjdfstest_chmod
+        add_tests test_pjdfstest_chown
+        add_tests test_pjdfstest_ftruncate
+        add_tests test_pjdfstest_granular
+        add_tests test_pjdfstest_link
+        add_tests test_pjdfstest_mknod
+        add_tests test_pjdfstest_open
+        add_tests test_pjdfstest_posix_fallocate
+        add_tests test_pjdfstest_truncate
+        # [NOTE]
+        # pjdfstest unlink/14.t expects fstat to return st_nlink=0 for a
+        # file which was unlinked while open.  With hard_remove, the
+        # kernel sends GETATTR without a file handle for a read-only fd
+        # and libfuse itself fails the pathless lookup with ESTALE, so
+        # this expectation cannot be satisfied.
+        if ! s3fs_args | grep -q hard_remove; then
+            add_tests test_pjdfstest_unlink
+        fi
+        add_tests test_pjdfstest_utimensat
+
+        # [NOTE][TODO]
+        # Temporary error workaround in Ubuntu 25.10
+        # In Ubuntu 25.10, there are test cases where the request header size exceeds
+        # 8192 bytes.
+        # Currently bypass running the below tests as s3proxy returns an error response.
+        # If s3proxy increases the allowed header size, we will resume these tests.
+        #
+        if ! ( . /etc/os-release 2>/dev/null && [ "${ID}" = "ubuntu" ] && [ "${VERSION_ID}" = "25.10" ] ); then
+            add_tests test_pjdfstest_mkdir
+            add_tests test_pjdfstest_mkfifo
+            add_tests test_pjdfstest_rename
+            add_tests test_pjdfstest_rmdir
+            add_tests test_pjdfstest_symlink
+        fi
+    fi
 }
 
 init_suite

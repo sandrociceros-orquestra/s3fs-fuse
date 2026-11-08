@@ -18,35 +18,32 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
+#include <cerrno>
+#include <cstdarg>
 #include <cstdlib>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <string>
+#include <sys/time.h>
+#include <unistd.h>
 
 #include "common.h"
 #include "s3fs_logger.h"
+#include "string_util.h"
 
 //-------------------------------------------------------------------
 // S3fsLog class : variables
 //-------------------------------------------------------------------
-const int               S3fsLog::NEST_MAX;
-const char* const       S3fsLog::nest_spaces[S3fsLog::NEST_MAX] = {"", "  ", "    ", "      "};
-const char              S3fsLog::LOGFILEENV[]     = "S3FS_LOGFILE";
-const char              S3fsLog::MSGTIMESTAMP[]   = "S3FS_MSGTIMESTAMP";
-S3fsLog*                S3fsLog::pSingleton       = NULL;
-S3fsLog::s3fs_log_level S3fsLog::debug_level      = S3fsLog::LEVEL_CRIT;
-FILE*                   S3fsLog::logfp            = NULL;
-std::string*            S3fsLog::plogfile         = NULL;
+S3fsLog*                S3fsLog::pSingleton       = nullptr;
+S3fsLog::Level          S3fsLog::debug_level      = S3fsLog::Level::CRIT;
+FILE*                   S3fsLog::logfp            = nullptr;
+std::string             S3fsLog::logfile;
 bool                    S3fsLog::time_stamp       = true;
 
 //-------------------------------------------------------------------
 // S3fsLog class : class methods
 //-------------------------------------------------------------------
-bool S3fsLog::IsS3fsLogLevel(s3fs_log_level level)
-{
-    return (level == (S3fsLog::debug_level & level));
-}
-
 std::string S3fsLog::GetCurrentTime()
 {
     std::ostringstream current_time;
@@ -59,7 +56,7 @@ std::string S3fsLog::GetCurrentTime()
             now.tv_sec  = tsnow.tv_sec;
             now.tv_usec = (tsnow.tv_nsec / 1000);
         }else{
-            gettimeofday(&now, NULL);
+            gettimeofday(&now, nullptr);
         }
         strftime(tmp, sizeof(tmp), "%Y-%m-%dT%H:%M:%S", gmtime_r(&now.tv_sec, &res));
         current_time << tmp << "." << std::setfill('0') << std::setw(3) << (now.tv_usec / 1000) << "Z ";
@@ -70,7 +67,7 @@ std::string S3fsLog::GetCurrentTime()
 bool S3fsLog::SetLogfile(const char* pfile)
 {
     if(!S3fsLog::pSingleton){
-        S3FS_PRN_CRIT("S3fsLog::pSingleton is NULL.");
+        S3FS_PRN_CRIT("S3fsLog::pSingleton is nullptr.");
         return false;
     }
     return S3fsLog::pSingleton->LowSetLogfile(pfile);
@@ -79,34 +76,34 @@ bool S3fsLog::SetLogfile(const char* pfile)
 bool S3fsLog::ReopenLogfile()
 {
     if(!S3fsLog::pSingleton){
-        S3FS_PRN_CRIT("S3fsLog::pSingleton is NULL.");
+        S3FS_PRN_CRIT("S3fsLog::pSingleton is nullptr.");
         return false;
     }
     if(!S3fsLog::logfp){
         S3FS_PRN_INFO("Currently the log file is output to stdout/stderr.");
         return true;
     }
-    if(!S3fsLog::plogfile){
-        S3FS_PRN_ERR("There is a problem with the path to the log file being NULL.");
+    if(!S3fsLog::logfile.empty()){
+        S3FS_PRN_ERR("There is a problem with the path to the log file being empty.");
         return false;
     }
-    std::string tmp = *(S3fsLog::plogfile);
+    std::string tmp = S3fsLog::logfile;
     return S3fsLog::pSingleton->LowSetLogfile(tmp.c_str());
 }
 
-S3fsLog::s3fs_log_level S3fsLog::SetLogLevel(s3fs_log_level level)
+S3fsLog::Level S3fsLog::SetLogLevel(S3fsLog::Level level)
 {
     if(!S3fsLog::pSingleton){
-        S3FS_PRN_CRIT("S3fsLog::pSingleton is NULL.");
+        S3FS_PRN_CRIT("S3fsLog::pSingleton is nullptr.");
         return S3fsLog::debug_level;    // Although it is an error, it returns the current value.
     }
     return S3fsLog::pSingleton->LowSetLogLevel(level);
 }
 
-S3fsLog::s3fs_log_level S3fsLog::BumpupLogLevel()
+S3fsLog::Level S3fsLog::BumpupLogLevel()
 {
     if(!S3fsLog::pSingleton){
-        S3FS_PRN_CRIT("S3fsLog::pSingleton is NULL.");
+        S3FS_PRN_CRIT("S3fsLog::pSingleton is nullptr.");
         return S3fsLog::debug_level;    // Although it is an error, it returns the current value.
     }
     return S3fsLog::pSingleton->LowBumpupLogLevel();
@@ -139,16 +136,13 @@ S3fsLog::~S3fsLog()
 {
     if(S3fsLog::pSingleton == this){
         FILE*    oldfp = S3fsLog::logfp;
-        S3fsLog::logfp = NULL;
+        S3fsLog::logfp = nullptr;
         if(oldfp && 0 != fclose(oldfp)){
-            S3FS_PRN_ERR("Could not close old log file(%s), but continue...", (S3fsLog::plogfile ? S3fsLog::plogfile->c_str() : "null"));
+            S3FS_PRN_ERR("Could not close old log file(%s), but continue...", (S3fsLog::logfile.empty() ? S3fsLog::logfile.c_str() : "null"));
         }
-        if(S3fsLog::plogfile){
-            delete S3fsLog::plogfile;
-            S3fsLog::plogfile = NULL;
-        }
-        S3fsLog::pSingleton  = NULL;
-        S3fsLog::debug_level = S3fsLog::LEVEL_CRIT;
+        S3fsLog::logfile.clear();
+        S3fsLog::pSingleton  = nullptr;
+        S3fsLog::debug_level = Level::CRIT;
 
         closelog();
     }else{
@@ -163,15 +157,16 @@ bool S3fsLog::LowLoadEnv()
         return false;
     }
     char*    pEnvVal;
-    if(NULL != (pEnvVal = getenv(S3fsLog::LOGFILEENV))){
+    if(nullptr != (pEnvVal = getenv(S3fsLog::LOGFILEENV))){
         if(!SetLogfile(pEnvVal)){
             return false;
         }
     }
-    if(NULL != (pEnvVal = getenv(S3fsLog::MSGTIMESTAMP))){
-        if(0 == strcasecmp(pEnvVal, "true") || 0 == strcasecmp(pEnvVal, "yes") || 0 == strcasecmp(pEnvVal, "1")){
+    if(nullptr != (pEnvVal = getenv(S3fsLog::MSGTIMESTAMP))){
+        auto env_val = CaseInsensitiveStringView(pEnvVal);
+        if(env_val == "true" || env_val == "yes" || env_val == "1"){
             S3fsLog::time_stamp = true;
-        }else if(0 == strcasecmp(pEnvVal, "false") || 0 == strcasecmp(pEnvVal, "no") || 0 == strcasecmp(pEnvVal, "0")){
+        }else if(env_val == "false" || env_val == "no" || env_val == "0"){
             S3fsLog::time_stamp = false;
         }else{
             S3FS_PRN_WARN("Unknown %s environment value(%s) is specified, skip to set time stamp mode.", S3fsLog::MSGTIMESTAMP, pEnvVal);
@@ -190,14 +185,11 @@ bool S3fsLog::LowSetLogfile(const char* pfile)
     if(!pfile){
         // close log file if it is opened
         if(S3fsLog::logfp && 0 != fclose(S3fsLog::logfp)){
-            S3FS_PRN_ERR("Could not close log file(%s).", (S3fsLog::plogfile ? S3fsLog::plogfile->c_str() : "null"));
+            S3FS_PRN_ERR("Could not close log file(%s).", (S3fsLog::logfile.empty() ? S3fsLog::logfile.c_str() : "null"));
             return false;
         }
-        S3fsLog::logfp = NULL;
-        if(S3fsLog::plogfile){
-            delete S3fsLog::plogfile;
-            S3fsLog::plogfile = NULL;
-        }
+        S3fsLog::logfp = nullptr;
+        S3fsLog::logfile.clear();
     }else{
         // open new log file
         //
@@ -205,27 +197,25 @@ bool S3fsLog::LowSetLogfile(const char* pfile)
         // It will reopen even if it is the same file.
         //
         FILE* newfp;
-        if(NULL == (newfp = fopen(pfile, "a+"))){
+        if(nullptr == (newfp = fopen(pfile, "a+"))){
             S3FS_PRN_ERR("Could not open log file(%s).", pfile);
             return false;
         }
 
         // switch new log file and close old log file if it is opened
         FILE*    oldfp = S3fsLog::logfp;
-        S3fsLog::logfp = newfp;
         if(oldfp && 0 != fclose(oldfp)){
-            S3FS_PRN_ERR("Could not close old log file(%s).", (S3fsLog::plogfile ? S3fsLog::plogfile->c_str() : "null"));
-            S3fsLog::logfp = oldfp;
+            S3FS_PRN_ERR("Could not close old log file(%s).", (!S3fsLog::logfile.empty() ? S3fsLog::logfile.c_str() : "null"));
             fclose(newfp);
             return false;
         }
-        delete S3fsLog::plogfile;
-        S3fsLog::plogfile = new std::string(pfile);
+        S3fsLog::logfp = newfp;
+        S3fsLog::logfile = pfile;
     }
     return true;
 }
 
-S3fsLog::s3fs_log_level S3fsLog::LowSetLogLevel(s3fs_log_level level)
+S3fsLog::Level S3fsLog::LowSetLogLevel(Level level)
 {
     if(S3fsLog::pSingleton != this){
         S3FS_PRN_ERR("This object is not as same as S3fsLog::pSingleton.");
@@ -234,27 +224,187 @@ S3fsLog::s3fs_log_level S3fsLog::LowSetLogLevel(s3fs_log_level level)
     if(level == S3fsLog::debug_level){
         return S3fsLog::debug_level;
     }
-    s3fs_log_level old   = S3fsLog::debug_level;
+    Level old   = S3fsLog::debug_level;
     S3fsLog::debug_level = level;
     setlogmask(LOG_UPTO(GetSyslogLevel(S3fsLog::debug_level)));
     S3FS_PRN_CRIT("change debug level from %sto %s", GetLevelString(old), GetLevelString(S3fsLog::debug_level));
     return old;
 }
 
-S3fsLog::s3fs_log_level S3fsLog::LowBumpupLogLevel()
+S3fsLog::Level S3fsLog::LowBumpupLogLevel() const
 {
     if(S3fsLog::pSingleton != this){
         S3FS_PRN_ERR("This object is not as same as S3fsLog::pSingleton.");
         return S3fsLog::debug_level;    // Although it is an error, it returns the current value.
     }
-    s3fs_log_level old   = S3fsLog::debug_level;
-    S3fsLog::debug_level = ( LEVEL_CRIT == S3fsLog::debug_level ? LEVEL_ERR  :
-                             LEVEL_ERR  == S3fsLog::debug_level ? LEVEL_WARN :
-                             LEVEL_WARN == S3fsLog::debug_level ? LEVEL_INFO :
-                             LEVEL_INFO == S3fsLog::debug_level ? LEVEL_DBG  : LEVEL_CRIT );
+    Level old   = S3fsLog::debug_level;
+    S3fsLog::debug_level = ( Level::CRIT == S3fsLog::debug_level ? Level::ERR  :
+                             Level::ERR  == S3fsLog::debug_level ? Level::WARN :
+                             Level::WARN == S3fsLog::debug_level ? Level::INFO :
+                             Level::INFO == S3fsLog::debug_level ? Level::DBG  : Level::CRIT );
     setlogmask(LOG_UPTO(GetSyslogLevel(S3fsLog::debug_level)));
     S3FS_PRN_CRIT("change debug level from %sto %s", GetLevelString(old), GetLevelString(S3fsLog::debug_level));
     return old;
+}
+
+void S3fsLog::Printf(FILE* fp, const char* fmt, ...)
+{
+    if(!fp){
+        return;
+    }
+    va_list va;
+    va_start(va, fmt);
+    int len = vsnprintf(nullptr, 0, fmt, va);
+    va_end(va);
+    if(len < 0){
+        return;
+    }
+
+    auto buf = std::make_unique<char[]>(static_cast<size_t>(len) + 1);
+    va_start(va, fmt);
+    vsnprintf(buf.get(), static_cast<size_t>(len) + 1, fmt, va);
+    va_end(va);
+
+    int fd = fileno(fp);
+    if(fd < 0){
+        return;
+    }
+    const char* p = buf.get();
+    auto remaining = static_cast<size_t>(len);
+    while(remaining > 0){
+        ssize_t w = write(fd, p, remaining);
+        if(w < 0){
+            if(errno == EINTR){
+                continue;
+            }
+            break;
+        }
+        p += w;
+        remaining -= static_cast<size_t>(w);
+    }
+}
+
+// Format a printf-style message into a heap buffer.
+//
+// [NOTE]
+// The caller owns the va_list (va_start/va_end); this helper only copies
+// it for the sizing pass and consumes the original for the format pass.
+//
+static std::unique_ptr<char[]> s3fs_vformat(const char* fmt, va_list va)
+{
+    va_list va2;
+    va_copy(va2, va);
+    int len = vsnprintf(nullptr, 0, fmt, va2);
+    va_end(va2);
+    len = std::max(len, 0);
+
+    auto message = std::make_unique<char[]>(static_cast<size_t>(len) + 1);
+    vsnprintf(message.get(), static_cast<size_t>(len) + 1, fmt, va);
+    return message;
+}
+
+void s3fs_low_logprn(S3fsLog::Level level, const char* file, const char *func, int line, const char *fmt, ...)
+{
+    // [NOTE]
+    // The level guard lives in the S3FS_LOW_LOGPRN macro so the log
+    // arguments are not evaluated when the level is disabled.
+    va_list va;
+    va_start(va, fmt);
+    auto message = s3fs_vformat(fmt, va);
+    va_end(va);
+
+    if(foreground || S3fsLog::IsSetLogFile()){
+        S3fsLog::Printf(S3fsLog::GetOutputLogFile(), "%s%s%s:%s(%d): %s\n", S3fsLog::GetCurrentTime().c_str(), S3fsLog::GetLevelString(level), file, func, line, message.get());
+    }else{
+        // TODO: why does this differ from s3fs_low_logprn2?
+        syslog(S3fsLog::GetSyslogLevel(level), "%s%s:%s(%d): %s", instance_name.c_str(), file, func, line, message.get());
+    }
+}
+
+void s3fs_low_logprn2(S3fsLog::Level level, int nest, const char* file, const char *func, int line, const char *fmt, ...)
+{
+    // [NOTE]
+    // The level guard lives in the S3FS_LOW_LOGPRN2 macro so the log
+    // arguments are not evaluated when the level is disabled.
+    va_list va;
+    va_start(va, fmt);
+    auto message = s3fs_vformat(fmt, va);
+    va_end(va);
+
+    if(foreground || S3fsLog::IsSetLogFile()){
+        S3fsLog::Printf(S3fsLog::GetOutputLogFile(), "%s%s%s%s:%s(%d): %s\n", S3fsLog::GetCurrentTime().c_str(), S3fsLog::GetLevelString(level), S3fsLog::GetS3fsLogNest(nest), file, func, line, message.get());
+    }else{
+        syslog(S3fsLog::GetSyslogLevel(level), "%s%s%s", instance_name.c_str(), S3fsLog::GetS3fsLogNest(nest), message.get());
+    }
+}
+
+void s3fs_low_curldbg(const char* fmt, ...)
+{
+    va_list va;
+    va_start(va, fmt);
+    auto message = s3fs_vformat(fmt, va);
+    va_end(va);
+
+    if(foreground || S3fsLog::IsSetLogFile()){
+        S3fsLog::Printf(S3fsLog::GetOutputLogFile(), "%s[CURL DBG] %s\n", S3fsLog::GetCurrentTime().c_str(), message.get());
+    }else{
+        syslog(S3fsLog::GetSyslogLevel(S3fsLog::Level::CRIT), "%s%s", instance_name.c_str(), message.get());
+    }
+}
+
+void s3fs_low_logprn_exit(const char* fmt, ...)
+{
+    va_list va;
+    va_start(va, fmt);
+    auto message = s3fs_vformat(fmt, va);
+    va_end(va);
+
+    S3fsLog::Printf(S3fsLog::GetErrorLogFile(), "s3fs: %s\n", message.get());
+    if(!(foreground || S3fsLog::IsSetLogFile())){
+        syslog(S3fsLog::GetSyslogLevel(S3fsLog::Level::CRIT), "%ss3fs: %s", instance_name.c_str(), message.get());
+    }
+}
+
+void s3fs_low_init_info(const char* file, const char *func, int line, const char *fmt, ...)
+{
+    va_list va;
+    va_start(va, fmt);
+    auto message = s3fs_vformat(fmt, va);
+    va_end(va);
+
+    if(foreground || S3fsLog::IsSetLogFile()){
+        S3fsLog::Printf(S3fsLog::GetOutputLogFile(), "%s%s%s%s:%s(%d): %s\n", S3fsLog::GetCurrentTime().c_str(), S3fsLog::GetLevelString(S3fsLog::Level::INFO), S3fsLog::GetS3fsLogNest(0), file, func, line, message.get());
+    }else{
+        syslog(S3fsLog::GetSyslogLevel(S3fsLog::Level::INFO), "%s%s%s", instance_name.c_str(), S3fsLog::GetS3fsLogNest(0), message.get());
+    }
+}
+
+void s3fs_low_launch_info(const char* fmt, ...)
+{
+    va_list va;
+    va_start(va, fmt);
+    auto message = s3fs_vformat(fmt, va);
+    va_end(va);
+
+    if(foreground || S3fsLog::IsSetLogFile()){
+        S3fsLog::Printf(S3fsLog::GetOutputLogFile(), "%s%s%s\n", S3fsLog::GetCurrentTime().c_str(), S3fsLog::GetLevelString(S3fsLog::Level::INFO), message.get());
+    }else{
+        syslog(S3fsLog::GetSyslogLevel(S3fsLog::Level::INFO), "%s%s", instance_name.c_str(), message.get());
+    }
+}
+
+void s3fs_low_cache(FILE* fp, const char* fmt, ...)
+{
+    va_list va;
+    va_start(va, fmt);
+    auto message = s3fs_vformat(fmt, va);
+    va_end(va);
+
+    if(foreground || S3fsLog::IsSetLogFile()){
+        S3fsLog::Printf(fp, "%s\n", message.get());
+    }else{
+        syslog(S3fsLog::GetSyslogLevel(S3fsLog::Level::INFO), "%s: %s", instance_name.c_str(), message.get());
+    }
 }
 
 /*

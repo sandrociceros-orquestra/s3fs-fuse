@@ -18,11 +18,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-#include <cstdio>
-#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <algorithm>
 
-#include "common.h"
-#include "s3fs.h"
 #include "s3objlist.h"
 
 //-------------------------------------------------------------------
@@ -33,77 +32,93 @@
 //
 // If name is terminated by "/", it is forced dir type.
 // If name is terminated by "_$folder$", it is forced dir type.
-// If is_dir is true and name is not terminated by "/", the name is added "/".
+// If is_dir is true, the name ends with "/", or the name ends with "_$folder$",
+// it will be determined to be a directory.
+// If it is determined to be a directory, the type is set from the evidence in
+// the name: "_$folder$" gives objtype_t::DIR_FOLDER_SUFFIX, everything else
+// gives objtype_t::DIR_NORMAL. If it is not a directory(file, symbolic link),
+// type will be set to objtype_t::UNKNOWN.
 //
-bool S3ObjList::insert(const char* name, const char* etag, bool is_dir)
+bool S3ObjList::insert(const char* name, const char* etag, bool is_dir, off_t size, const char* last_modified)
 {
     if(!name || '\0' == name[0]){
         return false;
     }
 
-    s3obj_t::iterator iter;
     std::string newname;
     std::string orgname = name;
+    objtype_t   type    = objtype_t::UNKNOWN;
 
     // Normalization
     std::string::size_type pos = orgname.find("_$folder$");
     if(std::string::npos != pos){
         newname = orgname.substr(0, pos);
-        is_dir  = true;
+        type    = objtype_t::DIR_FOLDER_SUFFIX;
     }else{
         newname = orgname;
     }
-    if(is_dir){
-        if('/' != *newname.rbegin()){
-            newname += "/";
+    if('/' == *newname.rbegin()){
+        if(!IS_DIR_OBJ(type)){
+            type = objtype_t::DIR_NORMAL;
         }
     }else{
-        if('/' == *newname.rbegin()){
-            is_dir = true;
+        if(is_dir || IS_DIR_OBJ(type)){
+            newname += "/";
+            if(!IS_DIR_OBJ(type)){
+                // [NOTE]
+                // A name without a slash and with is_dir=true comes from a
+                // CommonPrefixes element, whose trailing slash was cut when
+                // the name was extracted.  It carries no evidence of a
+                // legacy "dir" object(a Contents key without a slash would),
+                // so do not type it as DIR_NOT_TERMINATE_SLASH: readdir
+                // forwards this type to the stat cache once a HEAD request
+                // for "dir/" succeeds, and a wrong sub-type makes every
+                // later metadata update replace the directory object(and
+                // delete the "dir" key) instead of copying it.
+                //
+                type = objtype_t::DIR_NORMAL;
+            }
         }
     }
 
     // Check derived name object.
-    if(is_dir){
+    if(is_dir || IS_DIR_OBJ(type)){
         std::string chkname = newname.substr(0, newname.length() - 1);
-        if(objects.end() != (iter = objects.find(chkname))){
+        if(auto iter = objects.find(chkname); objects.cend() != iter){
             // found "dir" object --> remove it.
             objects.erase(iter);
         }
     }else{
         std::string chkname = newname + "/";
-        if(objects.end() != (iter = objects.find(chkname))){
+        if(objects.cend() != objects.find(chkname)){
             // found "dir/" object --> not add new object.
             // and add normalization
-            return insert_normalized(orgname.c_str(), chkname.c_str(), true);
+            return insert_normalized(orgname.c_str(), chkname.c_str(), type);
         }
     }
 
-    // Add object
-    if(objects.end() != (iter = objects.find(newname))){
-        // Found same object --> update information.
-        (*iter).second.normalname.erase();
-        (*iter).second.orgname = orgname;
-        (*iter).second.is_dir  = is_dir;
-        if(etag){
-            (*iter).second.etag = std::string(etag);  // over write
-        }
+    // Add new object or update the information of the found same object.
+    s3obj_entry& entry = objects.try_emplace(newname).first->second;
+    entry.normalname.clear();
+    entry.orgname = orgname;
+    entry.type    = type;
+    if(etag){
+        entry.etag = etag;  // over write
+    }
+    if(0 <= size){
+        entry.size = size;
     }else{
-        // add new object
-        s3obj_entry newobject;
-        newobject.orgname = orgname;
-        newobject.is_dir  = is_dir;
-        if(etag){
-            newobject.etag = etag;
-        }
-        objects[newname] = newobject;
+        entry.size = -1;
+    }
+    if(last_modified){
+        entry.last_modified = last_modified;
     }
 
     // add normalization
-    return insert_normalized(orgname.c_str(), newname.c_str(), is_dir);
+    return insert_normalized(orgname.c_str(), newname.c_str(), type);
 }
 
-bool S3ObjList::insert_normalized(const char* name, const char* normalized, bool is_dir)
+bool S3ObjList::insert_normalized(const char* name, const char* normalized, objtype_t type)
 {
     if(!name || '\0' == name[0] || !normalized || '\0' == normalized[0]){
         return false;
@@ -113,18 +128,18 @@ bool S3ObjList::insert_normalized(const char* name, const char* normalized, bool
     }
 
     s3obj_t::iterator iter;
-    if(objects.end() != (iter = objects.find(name))){
+    if(objects.cend() != (iter = objects.find(name))){
         // found name --> over write
-        iter->second.orgname.erase();
-        iter->second.etag.erase();
+        iter->second.orgname.clear();
+        iter->second.etag.clear();
         iter->second.normalname = normalized;
-        iter->second.is_dir     = is_dir;
+        iter->second.type       = type;
     }else{
         // not found --> add new object
         s3obj_entry newobject;
         newobject.normalname = normalized;
-        newobject.is_dir     = is_dir;
-        objects[name]        = newobject;
+        newobject.type       = type;
+        objects[name]        = std::move(newobject);
     }
     return true;
 }
@@ -134,12 +149,12 @@ const s3obj_entry* S3ObjList::GetS3Obj(const char* name) const
     s3obj_t::const_iterator iter;
 
     if(!name || '\0' == name[0]){
-        return NULL;
+        return nullptr;
     }
-    if(objects.end() == (iter = objects.find(name))){
-        return NULL;
+    if(objects.cend() == (iter = objects.find(name))){
+        return nullptr;
     }
-    return &((*iter).second);
+    return &(iter->second);
 }
 
 std::string S3ObjList::GetOrgName(const char* name) const
@@ -147,10 +162,10 @@ std::string S3ObjList::GetOrgName(const char* name) const
     const s3obj_entry* ps3obj;
 
     if(!name || '\0' == name[0]){
-        return std::string("");
+        return "";
     }
-    if(NULL == (ps3obj = GetS3Obj(name))){
-        return std::string("");
+    if(nullptr == (ps3obj = GetS3Obj(name))){
+        return "";
     }
     return ps3obj->orgname;
 }
@@ -160,13 +175,13 @@ std::string S3ObjList::GetNormalizedName(const char* name) const
     const s3obj_entry* ps3obj;
 
     if(!name || '\0' == name[0]){
-        return std::string("");
+        return "";
     }
-    if(NULL == (ps3obj = GetS3Obj(name))){
-        return std::string("");
+    if(nullptr == (ps3obj = GetS3Obj(name))){
+        return "";
     }
     if(ps3obj->normalname.empty()){
-        return std::string(name);
+        return name;
     }
     return ps3obj->normalname;
 }
@@ -176,71 +191,188 @@ std::string S3ObjList::GetETag(const char* name) const
     const s3obj_entry* ps3obj;
 
     if(!name || '\0' == name[0]){
-        return std::string("");
+        return "";
     }
-    if(NULL == (ps3obj = GetS3Obj(name))){
-        return std::string("");
+    if(nullptr == (ps3obj = GetS3Obj(name))){
+        return "";
     }
     return ps3obj->etag;
+}
+
+off_t S3ObjList::GetSize(const char* name) const
+{
+    const s3obj_entry* ps3obj;
+
+    if(!name || '\0' == name[0]){
+        return -1;
+    }
+    if(nullptr == (ps3obj = GetS3Obj(name))){
+        return -1;
+    }
+    return ps3obj->size;
+}
+
+std::string S3ObjList::GetLastModified(const char* name) const
+{
+    const s3obj_entry* ps3obj;
+
+    if(!name || '\0' == name[0]){
+        return "";
+    }
+    if(nullptr == (ps3obj = GetS3Obj(name))){
+        return "";
+    }
+    return ps3obj->last_modified;
 }
 
 bool S3ObjList::IsDir(const char* name) const
 {
     const s3obj_entry* ps3obj;
 
-    if(NULL == (ps3obj = GetS3Obj(name))){
+    if(nullptr == (ps3obj = GetS3Obj(name))){
         return false;
     }
-    return ps3obj->is_dir;
+    return IS_DIR_OBJ(ps3obj->type);
 }
 
-bool S3ObjList::GetLastName(std::string& lastname) const
+std::optional<std::string> S3ObjList::GetLastName() const
 {
     bool result = false;
-    lastname = "";
-    for(s3obj_t::const_iterator iter = objects.begin(); iter != objects.end(); ++iter){
-        if((*iter).second.orgname.length()){
-            if(0 > strcmp(lastname.c_str(), (*iter).second.orgname.c_str())){
-                lastname = (*iter).second.orgname;
+    std::string lastname;
+    for(const auto& [name, entry] : objects){
+        if(!entry.orgname.empty()){
+            if(lastname.compare(entry.orgname) < 0){
+                lastname = entry.orgname;
                 result = true;
             }
         }else{
-            if(0 > strcmp(lastname.c_str(), (*iter).second.normalname.c_str())){
-                lastname = (*iter).second.normalname;
+            if(lastname.compare(entry.normalname) < 0){
+                lastname = entry.normalname;
                 result = true;
             }
         }
     }
-    return result;
+    if(!result){
+        return std::nullopt;
+    }
+    return lastname;
 }
 
-bool S3ObjList::GetNameList(s3obj_list_t& list, bool OnlyNormalized, bool CutSlash) const
+bool S3ObjList::RawGetNames(s3obj_list_t* plist, s3obj_type_map_t* pobjmap, bool OnlyNormalized, bool CutSlash) const
 {
-    s3obj_t::const_iterator iter;
-
-    for(iter = objects.begin(); objects.end() != iter; ++iter){
-        if(OnlyNormalized && !iter->second.normalname.empty()){
+    if(!plist && !pobjmap){
+        return false;
+    }
+    for(const auto& [path, entry] : objects){
+        if(OnlyNormalized && !entry.normalname.empty()){
             continue;
         }
-        std::string name = (*iter).first;
+        std::string name = path;
         if(CutSlash && 1 < name.length() && '/' == *name.rbegin()){
             // only "/" std::string is skipped this.
             name.erase(name.length() - 1);
         }
-        list.push_back(name);
+        if(plist){
+            plist->push_back(name);
+        }
+        if(pobjmap){
+            (*pobjmap)[name] = entry.type;
+        }
     }
     return true;
 }
 
-typedef std::map<std::string, bool> s3obj_h_t;
+bool S3ObjList::GetNameList(s3obj_list_t& list, bool OnlyNormalized, bool CutSlash) const
+{
+    return RawGetNames(&list, nullptr, OnlyNormalized, CutSlash);
+}
+
+bool S3ObjList::GetNameMap(s3obj_type_map_t& objmap, bool OnlyNormalized, bool CutSlash) const
+{
+    return RawGetNames(nullptr, &objmap, OnlyNormalized, CutSlash);
+}
+
+bool S3ObjList::HasName(const std::string& strName) const
+{
+    if(strName.empty()){
+        return false;
+    }
+
+    std::string strWitoutSlash;
+    std::string strWithSlash;
+
+    if('/' == strName.back()){
+        strWitoutSlash = strName.substr(0, strName.size() - 1);
+        strWithSlash   = strName;
+    }else{
+        strWitoutSlash = strName;
+        strWithSlash   = strName + '/';
+    }
+    if(objects.end() != objects.find(strWitoutSlash) || objects.end() != objects.find(strWithSlash)){
+        return true;
+    }
+    return false;
+}
+
+bool S3ObjList::Remove(const std::string& strName)
+{
+    if(strName.empty()){
+        return false;
+    }
+
+    std::string strWitoutSlash;
+    std::string strWithSlash;
+
+    if('/' == strName.back()){
+        strWitoutSlash = strName.substr(0, strName.size() - 1);
+        strWithSlash   = strName;
+    }else{
+        strWitoutSlash = strName;
+        strWithSlash   = strName + '/';
+    }
+    objects.erase(strWitoutSlash);
+    objects.erase(strWithSlash);
+    common_prefixes.erase(std::remove(common_prefixes.begin(), common_prefixes.end(), strWitoutSlash), common_prefixes.end());
+    common_prefixes.erase(std::remove(common_prefixes.begin(), common_prefixes.end(), strWithSlash), common_prefixes.end());
+
+    return true;
+}
+
+void S3ObjList::Dump(const std::string& indent, std::ostringstream& oss) const
+{
+    std::string child_indent        = indent + "  ";
+    std::string child_member_indent = child_indent + "  ";
+
+    oss << indent << "S3ObjList::objects = {" << std::endl;
+    for(const auto& [name, entry] : objects){
+        oss << child_indent << "[" << name << "] = {" << std::endl;
+        oss << child_member_indent << "normalname    = " << entry.normalname        << std::endl;
+        oss << child_member_indent << "orgname       = " << entry.orgname           << std::endl;
+        oss << child_member_indent << "etag          = " << entry.etag              << std::endl;
+        oss << child_member_indent << "size          = " << entry.size              << std::endl;
+        oss << child_member_indent << "last_modified = " << entry.last_modified     << std::endl;
+        oss << child_member_indent << "type          = " << STR_OBJTYPE(entry.type) << std::endl;
+        oss << child_indent << "}" << std::endl;
+    }
+    oss << indent << "}" << std::endl;
+
+    std::string strtmp;
+    for(auto citer = common_prefixes.cbegin(); common_prefixes.cend() != citer; ++citer){
+        if(!strtmp.empty()){
+            strtmp += ", ";
+        }
+        strtmp += *citer;
+    }
+    oss << indent << "S3ObjList::common_prefixes = {" << strtmp << "}" << std::endl;
+}
+
+using s3obj_h_t = std::map<std::string, bool>;
 
 bool S3ObjList::MakeHierarchizedList(s3obj_list_t& list, bool haveSlash)
 {
     s3obj_h_t h_map;
-    s3obj_h_t::iterator hiter;
-    s3obj_list_t::const_iterator liter;
 
-    for(liter = list.begin(); list.end() != liter; ++liter){
+    for(auto liter = list.cbegin(); list.cend() != liter; ++liter){
         std::string strtmp = (*liter);
         if(1 < strtmp.length() && '/' == *strtmp.rbegin()){
             strtmp.erase(strtmp.length() - 1);
@@ -253,7 +385,7 @@ bool S3ObjList::MakeHierarchizedList(s3obj_list_t& list, bool haveSlash)
             if(strtmp.empty() || "/" == strtmp){
                 break;
             }
-            if(h_map.end() == h_map.find(strtmp)){
+            if(h_map.cend() == h_map.find(strtmp)){
                 // not found
                 h_map[strtmp] = false;
             }
@@ -261,14 +393,14 @@ bool S3ObjList::MakeHierarchizedList(s3obj_list_t& list, bool haveSlash)
     }
 
     // check map and add lost hierarchized directory.
-    for(hiter = h_map.begin(); hiter != h_map.end(); ++hiter){
-        if(false == (*hiter).second){
+    for(const auto& [name, found] : h_map){
+        if(false == found){
             // add hierarchized directory.
-            std::string strtmp = (*hiter).first;
+            std::string strtmp = name;
             if(haveSlash){
                 strtmp += "/";
             }
-            list.push_back(strtmp);
+            list.push_back(std::move(strtmp));
         }
     }
     return true;

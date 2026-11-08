@@ -21,7 +21,18 @@
 #ifndef S3FS_FDCACHE_FDINFO_H_
 #define S3FS_FDCACHE_FDINFO_H_
 
-#include "fdcache_untreated.h"
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+
+#include "common.h"
+#include "fdcache_entity.h"
+#include "psemaphore.h"
+#include "metaheader.h"
+#include "types.h"
+
+class UntreatedParts;
 
 //------------------------------------------------
 // Class PseudoFdInfo
@@ -29,23 +40,39 @@
 class PseudoFdInfo
 {
     private:
-        int             pseudo_fd;
-        int             physical_fd;
-        int             flags;              // flags at open
-        std::string     upload_id;
-        filepart_list_t upload_list;
-        UntreatedParts  untreated_list;     // list of untreated parts that have been written and not yet uploaded(for streamupload)
-        etaglist_t      etag_entities;      // list of etag string and part number entities(to maintain the etag entity even if MPPART_INFO is destroyed)
-
-        bool            is_lock_init;
-        pthread_mutex_t upload_list_lock;   // protects upload_id and upload_list
+        int                     pseudo_fd;
+        int                     physical_fd;
+        int                     flags;              // flags at open
+        mutable std::mutex      upload_list_lock;   // protects upload_id/fd, upload_list, etc.
+        std::string             upload_id       GUARDED_BY(upload_list_lock);   //
+        int                     upload_fd       GUARDED_BY(upload_list_lock);   // duplicated fd for uploading
+        filepart_list_t         upload_list     GUARDED_BY(upload_list_lock);
+        petagpool               etag_entities   GUARDED_BY(upload_list_lock);   // list of etag string and part number entities(to maintain the etag entity even if MPPART_INFO is destroyed)
+        int                     instruct_count  GUARDED_BY(upload_list_lock);   // number of instructions for processing by threads
+        int                     last_result     GUARDED_BY(upload_list_lock);   // the result of thread processing
+        Semaphore               uploaded_sem;                                   // use a semaphore to trigger an upload completion like event flag
 
     private:
-        bool Clear();
+        void Clear();
+        void CloseUploadFd();
+        bool OpenUploadFd();
+        void ResetUploadInfo() REQUIRES(upload_list_lock);
+        void RowInitialUploadInfo(const std::string& id, bool is_cancel_mp);
+        void IncreaseInstructionCount();
+        bool GetUploadInfo(std::string& id, int& fd) const;
+        bool ParallelMultipartUpload(const char* path, const mp_part_list_t& mplist, bool is_copy, const std::string& srcssekeymd5);
+        bool InsertUploadPart(off_t start, off_t size, int part_num, bool is_copy, etagpair** ppetag);
+        void CancelAllThreads();
+        bool ExtractUploadPartsFromUntreatedArea(off_t untreated_start, off_t untreated_size, mp_part_list_t& to_upload_list, filepart_list_t& cancel_upload_list, off_t max_mp_size);
+        bool IsUploadingHasLock() const REQUIRES(upload_list_lock);
 
     public:
-        PseudoFdInfo(int fd = -1, int open_flags = 0);
+        explicit PseudoFdInfo(int fd = -1, int open_flags = 0);
         ~PseudoFdInfo();
+        PseudoFdInfo(const PseudoFdInfo&) = delete;
+        PseudoFdInfo(PseudoFdInfo&&) = delete;
+        PseudoFdInfo& operator=(const PseudoFdInfo&) = delete;
+        PseudoFdInfo& operator=(PseudoFdInfo&&) = delete;
 
         int GetPhysicalFd() const { return physical_fd; }
         int GetPseudoFd() const { return pseudo_fd; }
@@ -54,23 +81,25 @@ class PseudoFdInfo
         bool Readable() const;
 
         bool Set(int fd, int open_flags);
-        bool ClearUploadInfo(bool is_clear_part = false, bool lock_already_held = false);
-        bool InitialUploadInfo(const std::string& id);
+        void ClearUploadInfo(bool is_cancel_mp = false);
+        void InitialUploadInfo(const std::string& id){ RowInitialUploadInfo(id, true); }
 
-        bool IsUploading() const { return !upload_id.empty(); }
-        bool GetUploadId(std::string& id) const;
-        bool GetEtaglist(etaglist_t& list);
+        bool IsUploading() const;
+        std::optional<std::string> GetUploadId() const;
+        bool GetEtaglist(etaglist_t& list) const;
 
-        bool AppendUploadPart(off_t start, off_t size, bool is_copy = false, etagpair** ppetag = NULL);
+        bool AppendUploadPart(off_t start, off_t size, bool is_copy = false, etagpair** ppetag = nullptr);
+        off_t GetNextUploadPos() const;
 
-        void ClearUntreated(bool lock_already_held = false);
-        bool ClearUntreated(off_t start, off_t size);
-        bool GetUntreated(off_t& start, off_t& size, off_t max_size, off_t min_size = MIN_MULTIPART_SIZE);
-        bool GetLastUntreated(off_t& start, off_t& size, off_t max_size, off_t min_size = MIN_MULTIPART_SIZE);
-        bool AddUntreated(off_t start, off_t size);
+        bool ParallelMultipartUploadAll(const char* path, const mp_part_list_t& to_upload_list, const mp_part_list_t& copy_list, const std::string& srcssekeymd5, int& result);
+        int PreMultipartUploadRequest(const std::string& strpath, const headers_t& meta);
+
+        int WaitAllThreadsExit();
+        ssize_t UploadBoundaryLastUntreatedArea(const char* path, const headers_t& meta, FdEntity* pfdent) REQUIRES(pfdent->GetMutex());
+        bool ExtractUploadPartsFromAllArea(const UntreatedParts& untreated_list, mp_part_list_t& to_upload_list, mp_part_list_t& to_copy_list, mp_part_list_t& to_download_list, filepart_list_t& cancel_upload_list, bool& wait_upload_complete, off_t max_mp_size, off_t file_size, bool use_copy);
 };
 
-typedef std::map<int, class PseudoFdInfo*> fdinfo_map_t;
+using fdinfo_map_t = std::map<int, std::unique_ptr<PseudoFdInfo>>;
 
 #endif // S3FS_FDCACHE_FDINFO_H_
 

@@ -21,6 +21,19 @@
 #ifndef S3FS_S3FS_UTIL_H_
 #define S3FS_S3FS_UTIL_H_
 
+#include <functional>
+#include <string>
+
+#ifndef CLOCK_REALTIME
+#define CLOCK_REALTIME          0
+#endif
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC         CLOCK_REALTIME
+#endif
+#ifndef CLOCK_MONOTONIC_COARSE
+#define CLOCK_MONOTONIC_COARSE  CLOCK_MONOTONIC
+#endif
+
 //-------------------------------------------------------------------
 // Functions
 //-------------------------------------------------------------------
@@ -28,21 +41,55 @@ std::string get_realpath(const char *path);
 
 void init_sysconf_vars();
 std::string get_username(uid_t uid);
-int is_uid_include_group(uid_t uid, gid_t gid);
+[[nodiscard]] int is_uid_include_group(uid_t uid, gid_t gid);
 
-std::string mydirname(const char* path);
-std::string mydirname(const std::string& path);
-std::string mybasename(const char* path);
-std::string mybasename(const std::string& path);
+std::string mydirname(std::string path);
+std::string mybasename(std::string path);
 
-int mkdirp(const std::string& path, mode_t mode);
+[[nodiscard]] int mkdirp(const std::string& path, mode_t mode);
 std::string get_exist_directory_path(const std::string& path);
-bool check_exist_dir_permission(const char* dirpath);
+[[nodiscard]] bool check_exist_dir_permission(const char* dirpath);
 bool delete_files_in_dir(const char* dir, bool is_remove_own);
 
-bool compare_sysname(const char* target);
-
 void print_launch_message(int argc, char** argv);
+
+const char* mask_sensitive_string(const char* sensitive);
+
+//-------------------------------------------------------------------
+// Utility for nanosecond time(timespec)
+//-------------------------------------------------------------------
+// Wrap fclose since it is illegal to take the address of a stdlib function
+int s3fs_fclose(FILE* fp);
+
+class scope_guard
+{
+    public:
+        template<class Callable>
+
+        explicit scope_guard(Callable&& undo_func)
+            : func(std::forward<Callable>(undo_func))
+        {}
+
+        ~scope_guard()
+        {
+            if(func != nullptr) {
+                func();
+            }
+        }
+
+        void dismiss()
+        {
+            func = nullptr;
+        }
+
+        scope_guard(const scope_guard&) = delete;
+        scope_guard(scope_guard&& other) = delete;
+        scope_guard& operator=(const scope_guard&) = delete;
+        scope_guard& operator=(scope_guard&&) = delete;
+
+    private:
+        std::function<void()> func;
+};
 
 #endif // S3FS_S3FS_UTIL_H_
 

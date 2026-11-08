@@ -20,24 +20,25 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
-#include "common.h"
-#include "s3fs.h"
+#include "s3fs_logger.h"
 #include "mpu_util.h"
 #include "curl.h"
 #include "s3fs_xml.h"
 #include "s3fs_auth.h"
 #include "string_util.h"
+#include "s3fs_threadreqs.h"
 
 //-------------------------------------------------------------------
 // Global variables
 //-------------------------------------------------------------------
-utility_incomp_type utility_mode = NO_UTILITY_MODE;
+utility_incomp_type utility_mode = utility_incomp_type::NO_UTILITY_MODE;
 
 //-------------------------------------------------------------------
 // Functions
 //-------------------------------------------------------------------
-static void print_incomp_mpu_list(incomp_mpu_list_t& list)
+static void print_incomp_mpu_list(const incomp_mpu_list_t& list)
 {
     printf("\n");
     printf("Lists the parts that have been uploaded for a specific multipart upload.\n");
@@ -46,11 +47,10 @@ static void print_incomp_mpu_list(incomp_mpu_list_t& list)
     if(!list.empty()){
         printf("---------------------------------------------------------------\n");
 
-        int cnt = 0;
-        for(incomp_mpu_list_t::iterator iter = list.begin(); iter != list.end(); ++iter, ++cnt){
-            printf(" Path     : %s\n", (*iter).key.c_str());
-            printf(" UploadId : %s\n", (*iter).id.c_str());
-            printf(" Date     : %s\n", (*iter).date.c_str());
+        for(auto iter = list.cbegin(); iter != list.cend(); ++iter){
+            printf(" Path     : %s\n", iter->key.c_str());
+            printf(" UploadId : %s\n", iter->id.c_str());
+            printf(" Date     : %s\n", iter->date.c_str());
             printf("\n");
         }
         printf("---------------------------------------------------------------\n");
@@ -60,47 +60,43 @@ static void print_incomp_mpu_list(incomp_mpu_list_t& list)
     }
 }
 
-static bool abort_incomp_mpu_list(incomp_mpu_list_t& list, time_t abort_time)
+static bool abort_incomp_mpu_list(const incomp_mpu_list_t& list, time_t abort_time)
 {
     if(list.empty()){
         return true;
     }
-    time_t now_time = time(NULL);
+    time_t now_time = time(nullptr);
 
     // do removing.
-    S3fsCurl s3fscurl;
     bool     result = true;
-    for(incomp_mpu_list_t::iterator iter = list.begin(); iter != list.end(); ++iter){
-        const char* tpath     = (*iter).key.c_str();
-        std::string upload_id = (*iter).id;
+    for(auto iter = list.cbegin(); iter != list.cend(); ++iter){
+        const char* tpath     = iter->key.c_str();
+        std::string upload_id = iter->id;
 
         if(0 != abort_time){    // abort_time is 0, it means all.
-            time_t    date = 0;
-            if(!get_unixtime_from_iso8601((*iter).date.c_str(), date)){
+            auto date = get_unixtime_from_iso8601(iter->date.c_str());
+            if(!date){
                 S3FS_PRN_DBG("date format is not ISO 8601 for %s multipart uploading object, skip this.", tpath);
                 continue;
             }
-            if(now_time <= (date + abort_time)){
+            if(now_time <= (*date + abort_time)){
                 continue;
             }
         }
 
-        if(0 != s3fscurl.AbortMultipartUpload(tpath, upload_id)){
+        if(0 != abort_multipart_upload_request(tpath, upload_id)){
             S3FS_PRN_EXIT("Failed to remove %s multipart uploading object.", tpath);
             result = false;
         }else{
             printf("Succeed to remove %s multipart uploading object.\n", tpath);
         }
-
-        // reset(initialize) curl object
-        s3fscurl.DestroyCurlHandle();
     }
     return result;
 }
 
 int s3fs_utility_processing(time_t abort_time)
 {
-    if(NO_UTILITY_MODE == utility_mode){
+    if(utility_incomp_type::NO_UTILITY_MODE == utility_mode){
         return EXIT_FAILURE;
     }
     printf("\n*** s3fs run as utility mode.\n\n");
@@ -115,23 +111,23 @@ int s3fs_utility_processing(time_t abort_time)
         // parse result(incomplete multipart upload information)
         S3FS_PRN_DBG("response body = {\n%s\n}", body.c_str());
 
-        xmlDocPtr doc;
-        if(NULL == (doc = xmlReadMemory(body.c_str(), static_cast<int>(body.size()), "", NULL, 0))){
+        std::unique_ptr<xmlDoc, decltype(&xmlFreeDoc)> doc(xmlReadMemory(body.c_str(), static_cast<int>(body.size()), "", nullptr, S3FS_XML_PARSE_FLAGS), xmlFreeDoc);
+        if(nullptr == doc){
             S3FS_PRN_DBG("xmlReadMemory exited with error.");
             result = EXIT_FAILURE;
 
         }else{
             // make incomplete uploads list
             incomp_mpu_list_t list;
-            if(!get_incomp_mpu_list(doc, list)){
+            if(!get_incomp_mpu_list(doc.get(), list)){
                 S3FS_PRN_DBG("get_incomp_mpu_list exited with error.");
                 result = EXIT_FAILURE;
 
             }else{
-                if(INCOMP_TYPE_LIST == utility_mode){
+                if(utility_incomp_type::INCOMP_TYPE_LIST == utility_mode){
                     // print list
                     print_incomp_mpu_list(list);
-                }else if(INCOMP_TYPE_ABORT == utility_mode){
+                }else if(utility_incomp_type::INCOMP_TYPE_ABORT == utility_mode){
                     // remove
                     if(!abort_incomp_mpu_list(list, abort_time)){
                         S3FS_PRN_DBG("an error occurred during removal process.");
@@ -139,7 +135,6 @@ int s3fs_utility_processing(time_t abort_time)
                     }
                 }
             }
-            S3FS_XMLFREEDOC(doc);
         }
     }
 

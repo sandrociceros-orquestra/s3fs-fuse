@@ -21,6 +21,9 @@
 #ifndef S3FS_SIGHANDLERS_H_
 #define S3FS_SIGHANDLERS_H_
 
+#include <memory>
+#include <thread>
+
 #include "psemaphore.h"
 
 //----------------------------------------------
@@ -29,17 +32,19 @@
 class S3fsSignals
 {
     private:
-        static S3fsSignals* pSingleton;
-        static bool         enableUsr1;
-
-        pthread_t*          pThreadUsr1;
-        Semaphore*          pSemUsr1;
+        static bool                  enableUsr1;
+        std::unique_ptr<std::thread> pThreadUsr1;
+        std::unique_ptr<Semaphore>   pSemUsr1;
 
     protected:
-        static S3fsSignals* get() { return pSingleton; }
+        static S3fsSignals* get()
+        {
+            static S3fsSignals singleton;
+            return &singleton;
+        }
 
         static void HandlerUSR1(int sig);
-        static void* CheckCacheWorker(void* arg);
+        static void CheckCacheWorker(Semaphore* pSem);
 
         static void HandlerUSR2(int sig);
         static bool InitUsr2Handler();
@@ -47,16 +52,20 @@ class S3fsSignals
         static void HandlerHUP(int sig);
         static bool InitHupHandler();
 
-        S3fsSignals();
-        ~S3fsSignals();
-
         bool InitUsr1Handler();
         bool DestroyUsr1Handler();
         bool WakeupUsr1Thread();
 
     public:
-        static bool Initialize();
-        static bool Destroy();
+        S3fsSignals();
+        ~S3fsSignals();
+        S3fsSignals(const S3fsSignals&) = delete;
+        S3fsSignals(S3fsSignals&&) = delete;
+        S3fsSignals& operator=(const S3fsSignals&) = delete;
+        S3fsSignals& operator=(S3fsSignals&&) = delete;
+
+        // Call get() to force the creation of a singleton object.
+        static bool Initialize() { (void)get(); return true; }
 
         static bool SetUsr1Handler(const char* path);
 };
